@@ -32,6 +32,7 @@ The inline runner step uses a watcher-shell pattern (`tail -F | grep -m1 <sentin
 - **No retry budget on trivial fixes.** A test may iterate trivially as many times as needed, provided each fix passes the handler's intent gate. The intent gate is the safety mechanism, not a counter.
 - **Flaky → one retry max.** A `flaky` handler classification gets exactly one retry. A second failure in the same target with `failure_type` again in the flaky set is treated as non-trivial (`escalate`).
 - **No code generation outside the handler.** The loop itself never edits source files. Only `iked-failure-handler` does (and only when it classifies the failure as `trivial`).
+- **Push escalations to Slack only in CLI context.** When `is_cli_context == true` and `slack_target` resolved at Stage 1, every Stage 3 escalation pushes a DM with the run/target/iteration, the handler's root-cause, and the suggested fix excerpt to `slack_target` **before** the interactive prompt fires. The IDE path (`is_cli_context == false`) never pushes — the user is already in front of the chat panel. Slack send failures are non-fatal; the loop always falls back to the local interactive prompt.
 
 ## Target-kind policy (encoded as a function in the loop)
 
@@ -94,7 +95,10 @@ def pick_flag(iteration_n: int, last_touched_paths: list[str]) -> str:
   "start_sha": "<HEAD at loop start>",
   "current_anchor_sha": "<HEAD or last-commit sha — accumulated diff is git diff <this>>",
   "tmux_session": "iked-loop-<run-id>",
-  "plan_save_path": "<.ai/plans/... or null>"
+  "plan_save_path": "<.ai/plans/... or null>",
+  "is_cli_context": true,
+  "slack_target": "<Slack user ID (e.g. U01ABC2DEF) or null>",
+  "slack_target_handle": "<the handle/email used to look the user up — for audit; null when not resolved>"
 }
 ```
 
@@ -115,10 +119,19 @@ def pick_flag(iteration_n: int, last_touched_paths: list[str]) -> str:
    4. Two or more sessions → HALT with `blocker: multiple-sessions-found`. Surface to the parent a list of `<session_name> (<n> windows / <m> panes, last activity <ISO-8601>)` lines so the user can pick. Resume on the next invocation with the chosen session name passed in (treat the picked name as if it were the sole session in step 3). Do **not** auto-pick.
    5. Verify the chosen session has at least one pane whose `pane_current_command` is a plain shell (`bash`, `zsh`, `fish`, `sh`, `dash`). If none, HALT with `blocker: no-idle-pane`; the runner cannot send-keys safely into a pane running a foreground program.
    6. Write the chosen session name to the `tmux_session` file.
-7. Write `meta.json` and `plan.yml` (initial state, every item `status: queued`). Include `session_origin` in `meta.json` so subsequent runs can audit the choice.
-8. If `save_plan == true`, also `cp meta.json plan.yml` under `/home/dn/cheetah/.ai/plans/iked-loop-<run_id>/`.
+7. Detect runtime context and resolve the Slack escalation target (used only at Stage 3 to push non-trivial findings out-of-band):
+   1. `is_cli_context` is `true` iff `$CURSOR_AGENT` is set AND both `$VSCODE_AGENT_FOLDER` and `$CURSOR_LAYOUT` are unset. The Cursor IDE host always sets the latter two (`CURSOR_LAYOUT=unifiedAgent` for the agent panel); the standalone `cursor-agent` CLI does not. Use `printenv` per-variable, not a substring grep, to avoid false positives.
+   2. When `is_cli_context == false` → set `slack_target = null`, `slack_target_handle = null`, skip the rest of step 7. The IDE user is already watching the chat panel; no Slack push is needed.
+   3. When `is_cli_context == true`, resolve the Slack handle by checking, in order, the first non-empty value:
+      - Env var `IKED_LOOP_SLACK_USER` (explicit override; pass through verbatim).
+      - `git -C <repo_root> config user.email` → take the local-part (substring before `@`).
+      - `git -C <repo_root> config user.name`.
+      Record this as `slack_target_handle`. If all three are empty → set `slack_target = null` and log a warning that Stage 3 will fall back to interactive-only.
+   4. With a non-null handle, look the Slack user up via `slackbot_slack_find_user(username_or_display_name=<handle>)`. On success record the returned Slack user ID as `slack_target`. On failure (no match / Slack error) → set `slack_target = null`, log a one-line warning identifying the handle that did not resolve, and continue. Do **not** halt the loop — Stage 3 must still work without Slack.
+8. Write `meta.json` and `plan.yml` (initial state, every item `status: queued`). Include `session_origin`, `is_cli_context`, `slack_target`, and `slack_target_handle` in `meta.json` so subsequent runs and audits can reconstruct the choices.
+9. If `save_plan == true`, also `cp meta.json plan.yml` under `/home/dn/cheetah/.ai/plans/iked-loop-<run_id>/`.
 
-**Gate:** `meta.json` exists, the tmux session is identified (reused or created), it has at least one idle shell pane, commits are valid, and the user is OK with the starting working-tree state.
+**Gate:** `meta.json` exists, the tmux session is identified (reused or created), it has at least one idle shell pane, commits are valid, the user is OK with the starting working-tree state, and `is_cli_context` plus `slack_target` are recorded (the latter may be `null` and that is OK).
 
 ### Stage 2: For each plan item — run loop
 For each item in `plan` (in order), and within an item for each retry iteration:
@@ -334,9 +347,19 @@ The handler has already written `<item_dir>/suggested-fix.md`. The loop:
 
    (Use `AskQuestion` when available so the user sees a structured choice.)
 
-2. Wait for the answer.
+2. **Push to Slack if in CLI context.** Read `is_cli_context` and `slack_target` from `meta.json`. When both `is_cli_context == true` AND `slack_target != null`, send a DM via `slackbot_slack_send_msg(channel=<slack_target>, message_content=<body>)` **before** waiting for the user's answer in step 3. The body must include, in this order:
+   - One-line header: `:rotating_light: iked-test-loop escalation — run <run_id>` on `<repo_root>` (host `<hostname>`).
+   - Agent info: `target: <target>` (kind `<new|regression>`), `iteration: <N>`, `flag chain so far: <c, c, b, ...>`, `tmux session: <tmux_session>`.
+   - Problem description: the `root_cause` and `non_trivial_reason` strings from `<item_dir>/rca/evidence.json`, followed by the absolute path to the full handler report (`<item_dir>/rca/summary.md`).
+   - Suggested fix: the absolute path (`<item_dir>/suggested-fix.md`) followed by the first ~40 lines of that file quoted inside a Slack code block (triple-backtick). Truncate longer fixes with `... (truncated — see file)`.
+   - The 4 choices (a–d) verbatim so the user knows what the loop is waiting on.
+   - A final line: `Reply locally via the agent prompt — this Slack message is a push notification, not the answer channel.`
 
-3. Branch on the answer:
+   The DM is purely informational. Send failures (Slack API error, network blip, etc.) are non-fatal: log a one-line warning and continue to step 3 with the local interactive prompt as before. Do NOT retry, do NOT halt.
+
+3. Wait for the answer.
+
+4. Branch on the answer:
 
    - **(a) Aggregate.** Apply the candidate diff from `suggested-fix.md` to the working tree (run `git apply <derived patch>` or hand-apply if the report only contains a pseudo-diff and the user provided guidance). Update `last_touched_paths` to the changed file set. Re-queue the same target. Go to Stage 2 with the next iteration.
    - **(b) Commit and continue.** Run the commit using `git-conventions`:
@@ -423,7 +446,9 @@ A markdown summary (Stage 4 shape) plus the file tree under `~/.iked-runs/<run_i
 [ ] The build flag for each iteration came from the policy table: first iteration `-c`, then `-b` iff `last_touched_paths` includes `services/control/**`, otherwise no flag.
 [ ] `containers_state` in `verdict.json` was set per the heuristic (`==> Running ` marker presence) on every failure, so `iked-failure-handler` knows whether containers are live.
 [ ] Trivial fixes accumulated in the working tree; the loop never auto-committed.
+[ ] At Stage 1 step 7, `is_cli_context` was set per the env-var rule (`CURSOR_AGENT` set AND `VSCODE_AGENT_FOLDER`/`CURSOR_LAYOUT` both unset), the Slack handle was resolved via the documented chain (`IKED_LOOP_SLACK_USER` → git `user.email` local-part → git `user.name`) and looked up via `slackbot_slack_find_user`, and both `is_cli_context` and `slack_target` (or `null`) were persisted in `meta.json`. A failed Slack lookup did not halt the loop.
 [ ] Non-trivial escalations always presented the Suggested Fix to the user and waited for one of the 4 documented choices before continuing.
+[ ] Whenever `is_cli_context == true` AND `slack_target != null`, every Stage 3 escalation pushed a DM via `slackbot_slack_send_msg` to `slack_target` (containing run/target/iteration, root-cause + non_trivial_reason, and the suggested-fix excerpt) **before** the interactive prompt fired. IDE-context runs (`is_cli_context == false`) never pushed. Slack send failures were logged and bypassed without halting.
 [ ] `commit-and-continue` used `git-conventions` to compose the message and only staged files inside the accumulated diff (no blind `git add -A`).
 [ ] `current_anchor_sha` was updated after every commit; "accumulated diff" always means `git diff <current_anchor_sha>`.
 [ ] Plan items were attempted in input order; tests never ran in parallel.
