@@ -16,6 +16,8 @@ Written at Stage 1 and updated at every commit / Slack-resolution / anchor chang
   "current_anchor_sha": "<HEAD or last-commit sha — accumulated diff is `git diff <this>`>",
   "tmux_session": "iked-loop-<run_id>",
   "session_origin": "created | reused-sole",
+  "known_suites": ["routing", "cdnos", "cli_tests", "cli_infra", "..."],
+  "known_suites_source": "<abs path to captured `test_ike.sh --list` output>",
   "plan_save_path": "<.ai/plans/iked-loop-<run_id>/ or null>",
   "is_cli_context": true,
   "slack_target": "<Slack user ID, e.g. U01ABC2DEF, or null>",
@@ -23,6 +25,8 @@ Written at Stage 1 and updated at every commit / Slack-resolution / anchor chang
   "save_plan": false
 }
 ```
+
+`known_suites` is populated from `test_ike.sh --list` at Stage 1 step 6 (parse the `Suites:` block). It is the only place the loop looks up valid suite names — `target_kind()` consults this list, never a hardcoded literal. The example above shows the 2026-05 registry; the actual contents are whatever `test_ike.sh --list` reports at run time.
 
 ## `verdict.json` — per-iteration test result
 
@@ -63,7 +67,7 @@ Written at Stage 2b. Contents: `new` or `regression` (no newline ok). The value 
 
 ## `<item_dir>/rca/evidence.json`
 
-Owned by `iked-failure-handler`; see that skill's "Output contract". The loop reads `classification`, `next_action`, `non_trivial_reason`, `touched_paths`, `patch_path`, `suggested_fix_path`, `root_cause`.
+Owned by `iked-failure-handler`; see that skill's "Output contract". The loop reads `classification`, `next_action`, `non_trivial_reason`, `relatedness`, `touched_paths`, `patch_path`, `suggested_fix_path`, `root_cause`.
 
 ## Run-state directory tree
 

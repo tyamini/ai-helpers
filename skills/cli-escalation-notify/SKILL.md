@@ -31,6 +31,7 @@ The skill is **fire-and-forget**:
 
 ## Hard invariants
 
+- **Tool availability is observed, never inferred.** The harness may expose the Slack MCP tools under a **prefixed** name (e.g. `dn-mcp-server-slackbot_slack_send_msg` / `dn-mcp-server-slackbot_slack_find_user` rather than the bare `slackbot_slack_*` used in this doc). A tool name that does not match this doc verbatim does **not** mean the tool is absent — match by suffix. Never return `skipped` because you *believe* the Slack integration "isn't available": the only valid skip reasons are the four below (`ide-context`, `no-handle`, `lookup-failed`, `send-failed`), each derived from an **actual** tool result or context check — there is no "tool-not-present" skip. If you are genuinely unsure the Slack wiring is live, make one cheap `slack_test_connection` call and branch on its real result; do not pre-judge.
 - **CLI-only.** When `is_cli_context == false` the skill returns `{status: "skipped", reason: "ide-context"}` without making any tool calls.
 - **Non-fatal.** No failure path raises or halts. Worst case is `{status: "skipped", reason: "<why>"}`.
 - **One DM per call.** No retries, no fan-out to channels, no @-mentions. If the call fails, the parent's interactive prompt is the canonical fallback.
@@ -40,7 +41,9 @@ The skill is **fire-and-forget**:
 
 ### 1. Detect context
 
-`is_cli_context == true` iff `$CURSOR_AGENT` is set AND **both** `$VSCODE_AGENT_FOLDER` and `$CURSOR_LAYOUT` are unset. The Cursor IDE host always sets the latter two (`CURSOR_LAYOUT=unifiedAgent` for the agent panel); the standalone `cursor-agent` CLI does not. Use `printenv VAR` per variable, not a substring grep, to avoid false positives.
+`is_cli_context == true` iff `$CURSOR_AGENT` is set AND `$CURSOR_LAYOUT` is unset. The Cursor IDE host sets `CURSOR_LAYOUT` (e.g. `unifiedAgent` for the agent panel); the standalone `cursor-agent` CLI does not. Use `printenv VAR` per variable, not a substring grep, to avoid false positives.
+
+> Do **not** also gate on `$VSCODE_AGENT_FOLDER`. On a Cursor remote-server / SSH dev box the cursor-server exports `VSCODE_AGENT_FOLDER` into every shell, so the CLI inherits it too — gating on it makes this skill wrongly report IDE context (and silently skip the Slack DM) on the dominant remote-dev workflow. `CURSOR_LAYOUT` is the only reliable IDE-vs-CLI discriminator.
 
 If `is_cli_context == false` → return `{status: "skipped", reason: "ide-context"}`. Stop.
 

@@ -9,6 +9,7 @@ Render via `AskQuestion` when available so the user sees a structured choice; ot
 ```
 Non-trivial failure on target <target> (iteration <N>).
 Reason: <non_trivial_reason>
+Relatedness: <relatedness>  (caused-by-changes | unrelated-to-changes | inconclusive)
 Handler report: <run_dir>/rca/summary.md
 Suggested fix:  <run_dir>/suggested-fix.md
 

@@ -18,9 +18,9 @@ Stage 2c uses a watcher-shell pattern (`tail -F | grep -m1 <sentinel>` + `AwaitS
 
 ## Inputs
 
-- `plan` (required) — ordered list of targets. Each item is either a single test name (e.g. `test_ipsec_iked_tunnel_initiation`) or a bare suite name (`routing`, `cdnos`, `cli_tests`). The order is honored. By convention the user front-loads new-feature tests before regression sweeps.
+- `plan` (required) — ordered list of targets. Each item is either a single test name (e.g. `test_ipsec_iked_tunnel_initiation`) or a bare suite name. The set of valid suite names comes from `test_ike.sh --list` (the `Suites:` block) — see Stage 1 step 6. The order is honored. By convention the user front-loads new-feature tests before regression sweeps.
 - `commits` (required) — list of commit SHAs in this checkout that represent the "new code under test". Used by `iked-failure-handler` to scope its trivial-fix gate.
-- `suite_hint` (optional, per-item) — `--suite=<routing|cdnos|cli_tests>` when a test name is ambiguous across suites.
+- `suite_hint` (optional, per-item) — `--suite=<name>` (where `<name>` is one of the suites reported by `test_ike.sh --list`) when a test name is ambiguous across suites.
 - `save_plan` (optional, default `false`) — when `true`, also mirror plan/state under `/home/dn/cheetah/.ai/plans/iked-loop-<run-id>/`. Otherwise state stays under `~/.iked-runs/<run-id>/`.
 
 ## Companion docs
@@ -47,7 +47,7 @@ Stage 2c uses a watcher-shell pattern (`tail -F | grep -m1 <sentinel>` + `AwaitS
 
 ## Target-kind policy
 
-Each plan item is classified at Stage 2b and passed to `iked-failure-handler` so it can tune its trivial-fix gate (the handler loosens for `new` targets). Rule: bare `routing|cdnos|cli_tests` → `regression`; anything else → `new`. The user can override per item with a `<target>@new` / `<target>@regression` suffix; the loop strips the suffix when launching the test.
+Each plan item is classified at Stage 2b and passed to `iked-failure-handler`, which uses `target_kind` to set the relatedness bar and the trivial-fix scope: for a `regression` target the handler must still produce a real root cause and a defensible `caused-by-changes` / `unrelated-to-changes` / `inconclusive` verdict (treating "unrelated" as a high bar, never the default), and it may fix a genuine intent-preserving test-file slip in place rather than bypassing the test. Rule: bare suite name (any string in `meta.json.known_suites`, populated at Stage 1 step 6 from `test_ike.sh --list`) → `regression`; anything else → `new`. The user can override per item with a `<target>@new` / `<target>@regression` suffix; the loop strips the suffix when launching the test. `test_ike.sh` is the single source of truth for the suite registry — the loop never hardcodes suite names.
 
 ## Build-flag policy
 
@@ -82,10 +82,11 @@ Full schemas: `references/state-schema.md`.
 3. Record `start_sha = git rev-parse HEAD`, `current_anchor_sha = start_sha`.
 4. Verify each input commit: `git cat-file -e <sha>` per commit. HALT `bad-commit` if any fail.
 5. **Tmux session selection.** `tmux list-sessions -F '#{session_name}'` (treat non-zero exit as "no sessions"). Apply the cases above. On reuse, verify the chosen session has at least one pane whose `pane_current_command` is a plain shell (`bash|zsh|fish|sh|dash`); if none, HALT `no-idle-pane`. Write the chosen name to `tmux_session`. Record `session_origin` (`created` or `reused-sole`).
-6. **Detect runtime context for `meta.json`.** `is_cli_context == true` iff `$CURSOR_AGENT` set AND both `$VSCODE_AGENT_FOLDER` and `$CURSOR_LAYOUT` unset (use `printenv VAR` per variable). Record it. Slack target resolution is delegated entirely to `cli-escalation-notify` at Stage 3 — the loop does not look up handles itself.
-7. Write `meta.json` and `plan.yml` (every item `status: queued`). If `save_plan == true`, mirror to `/home/dn/cheetah/.ai/plans/iked-loop-<run_id>/`.
+6. **Discover known suites.** Run `<repo_root>/services/control/quagga/iked/scripts/test_ike.sh --list` once. Parse the lines under the `Suites:` header up to the first blank line (or the `Tests:` header), strip whitespace, drop empties — that is `known_suites`. HALT `suite-discovery-failed` if `--list` exits non-zero or yields zero suites (the registry parse is broken; do not silently default). Validate every plan item: bare suite tokens (no `@new`/`@regression` suffix) must either be in `known_suites` or be auto-detectable as a test method (defer that check to `test_ike.sh` itself at runtime — the loop only validates the strings it would treat as suites). Validate `suite_hint` per item: must be in `known_suites`. Persist `known_suites` and the raw `--list` output path under `meta.json` for audit. The loop reads `known_suites` only at Stage 2b — no re-discovery mid-run.
+7. **Detect runtime context for `meta.json`.** `is_cli_context == true` iff `$CURSOR_AGENT` set AND `$CURSOR_LAYOUT` unset (use `printenv VAR` per variable). Do **not** also gate on `$VSCODE_AGENT_FOLDER`: on a Cursor remote-server / SSH dev box it is exported into every shell (CLI included), so gating on it wrongly reports IDE context and suppresses the Stage 3 Slack push. `CURSOR_LAYOUT` is the only reliable IDE-vs-CLI discriminator and must match the rule in `cli-escalation-notify`. Record it. Slack target resolution is delegated entirely to `cli-escalation-notify` at Stage 3 — the loop does not look up handles itself.
+8. Write `meta.json` and `plan.yml` (every item `status: queued`). If `save_plan == true`, mirror to `/home/dn/cheetah/.ai/plans/iked-loop-<run_id>/`.
 
-**Gate:** `meta.json` exists, the tmux session is identified with at least one idle shell pane, all input commits are valid, the user has decided about a dirty tree.
+**Gate:** `meta.json` exists with a non-empty `known_suites`, the tmux session is identified with at least one idle shell pane, all input commits are valid, the user has decided about a dirty tree.
 
 ### Stage 2: For each plan item — run loop
 
@@ -144,7 +145,7 @@ The loop runs the test directly — no sub-agent dispatch — using the dual-det
 
    The handler does RCA *and* triage in a single dispatch. On `trivial` it applies the patch itself (saves to `<item_dir>/patch.diff`). On `non-trivial` it writes `<item_dir>/suggested-fix.md`. On `flaky` it does nothing. When `pdb_pane` is set, the handler is **responsible for quitting pdb** (`tmux send-keys -t <pdb_pane> "q" Enter`) before returning.
 
-   Wait for the handler. Read `<item_dir>/rca/evidence.json` for `classification`, `next_action`, `non_trivial_reason`, `touched_paths`, `patch_path`, `suggested_fix_path`. Append `handler_status` and (when ready) `handler_summary` to `verdict.json`.
+   Wait for the handler. Read `<item_dir>/rca/evidence.json` for `classification`, `next_action`, `non_trivial_reason`, `relatedness`, `touched_paths`, `patch_path`, `suggested_fix_path`. Append `handler_status` and (when ready) `handler_summary` to `verdict.json`.
 
 8. **Post-handler finalization** — debugger path only:
 
@@ -184,6 +185,7 @@ The handler has already written `<item_dir>/suggested-fix.md`.
    - `body_md`:
      - **Root cause** (one sentence from `evidence.json.root_cause`).
      - **Reason** (`evidence.json.non_trivial_reason`).
+     - **Relatedness** (`evidence.json.relatedness` — `caused-by-changes` / `unrelated-to-changes` / `inconclusive`).
      - Path to handler report: `<item_dir>/rca/summary.md`.
      - Path to suggested fix: `<item_dir>/suggested-fix.md`, followed by the first ~40 lines of that file in a Slack code block (triple-backtick). Truncate longer fixes with `... (truncated — see file)`.
      - The 4 choices (a–d) verbatim so the user knows what the loop is waiting on.
@@ -214,6 +216,7 @@ The loop stops mid-flow and surfaces the situation when one of these fires:
 - `dirty-tree-unresolved` — Stage 1 step 2; user did not pick a path.
 - `multiple-sessions-found` — Stage 1 step 5; more than one tmux session exists.
 - `no-idle-pane` — Stage 1 step 5 / Stage 2c step 1; no plain-shell pane available.
+- `suite-discovery-failed` — Stage 1 step 6; `test_ike.sh --list` failed or produced no suites, or a plan item / `suite_hint` references a name not in `known_suites`.
 - `runner-timeout` — Stage 2c step 5; AwaitShell exceeded the 2-hour cap.
 - `pane-vanished` — Stage 2c step 5; pane is gone after AwaitShell returned.
 - `pdb-teardown-timeout` — Stage 2c step 8; handler did not quit pdb and the safety net failed.
@@ -225,7 +228,7 @@ In every halt case:
 1. Persist whatever state exists to `meta.json` and `plan.yml`.
 2. Do **not** commit, do **not** clean tmux, do **not** clean `~/.iked-runs/<run_id>/`.
 3. Print the halt-summary variant from `references/stage4-summary.md`.
-4. Where the halt is meaningful for the user (Stage 3 hand-off, `runner-timeout`, `pdb-teardown-timeout`, handler blocker), dispatch `cli-escalation-notify` with `title: iked-test-loop halted — <halt_code>` so a CLI user is told without watching the terminal. `bad-commit` / `multiple-sessions-found` / `no-idle-pane` / `dirty-tree-unresolved` happen at Stage 1 before any work, so a notification adds noise — skip those.
+4. Where the halt is meaningful for the user (Stage 3 hand-off, `runner-timeout`, `pdb-teardown-timeout`, handler blocker), dispatch `cli-escalation-notify` with `title: iked-test-loop halted — <halt_code>` so a CLI user is told without watching the terminal. `bad-commit` / `multiple-sessions-found` / `no-idle-pane` / `dirty-tree-unresolved` / `suite-discovery-failed` happen at Stage 1 before any work, so a notification adds noise — skip those.
 
 ## Output format
 
@@ -236,6 +239,7 @@ A markdown summary (Stage 4 shape) plus the file tree under `~/.iked-runs/<run_i
 Before returning, sanity-check:
 
 - [ ] One tmux session was selected at start and reused for every iteration; no busy panes were hijacked.
+- [ ] `known_suites` was populated at Stage 1 step 6 by parsing `test_ike.sh --list` (no hardcoded suite names), and `target_kind()` consulted that list — not a literal.
 - [ ] Trivial fixes accumulated in the working tree; nothing was auto-committed; `current_anchor_sha` was updated only on explicit `commit-and-continue`.
 - [ ] Every Stage 3 escalation went through `cli-escalation-notify` (status recorded in `meta.json`) and the local interactive prompt fired regardless of notify outcome.
 - [ ] On the debugger path, the loop did not quit pdb itself; the handler did, with the safety net only firing on handler failure.
