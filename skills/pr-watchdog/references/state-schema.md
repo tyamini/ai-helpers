@@ -36,7 +36,11 @@ Written at Stage 1; updated at every push / escalation / event.
   "url": "https://github.com/drivenets/cheetah/pull/91682",
   "branch": "<head branch>",
   "base_branch": "<base branch>",
-  "worktree": "<abs path to fix worktree>",
+  "worktree": "<abs path to fix worktree, or <repo_root> when worktree_mode == main>",
+  "worktree_mode": "worktree | main | dedicated",
+  "worktree_created": "<bool — true if the watchdog created a NEW worktree this run (make_worktree.sh CREATED); drives Stage 5 cleanup>",
+  "dedicated_branch": "<dedicated branch name, only when worktree_mode == dedicated, else null>",
+  "push_target": "<branch fixes are pushed to; == branch (dedicated mode makes this explicit)>",
   "interval_seconds": 600,
   "is_cli_context": true,
   "last_overall": "NO_CI | RUNNING | PASSED | FAILED",
@@ -52,6 +56,12 @@ Written at Stage 1; updated at every push / escalation / event.
 
 `is_cli_context == true` iff `$CURSOR_AGENT` is set AND `$CURSOR_LAYOUT` is unset
 (matches `cli-escalation-notify`). Do NOT also gate on `$VSCODE_AGENT_FOLDER`.
+
+`worktree_mode` is `worktree` by default (an isolated worktree checked out on the PR branch).
+On a `worktree-conflict` (PR branch already checked out in the main repo) the user may opt
+into `main` (fixes applied in `<repo_root>`, which is recorded as `worktree`; never
+`reset --hard`) or `dedicated` (a worktree on `dedicated_branch`, based on `origin/<branch>`,
+pushed to `push_target == branch`). See Stage 1 step 4.
 
 ## `situation.json` — per-cycle observation
 
@@ -88,8 +98,8 @@ Verbatim stdout of `scripts/pr_watchdog.py status --pr <pr>`:
 {
   "cycle": 3,
   "situation": "failed",
-  "decision": "wait | trigger | update-branch | fix-lint | fix-validate | prebuild-fix | investigate | escalate | done",
-  "fix_kind": "lint | validate | branch-update | prebuild | code-fix | null",
+  "decision": "wait | trigger | update-branch | prebuild-fix | investigate | escalate | done",
+  "fix_kind": "branch-update | prebuild | code-fix | null",
   "prebuild_result": "fixed-locally | needs-escalation | null",
   "cycles_used": 0,
   "auto_pushed": false,
@@ -106,12 +116,13 @@ Never push a partial fix (e.g. the base-merge alone). A `meta.json.pushes[]` ent
 the whole batch (`kinds` may list several, e.g. `["branch-update", "prebuild"]`).
 
 What may be in a batch and whether it needs the user gate before the push:
-- **Safe / deterministic, no gate:** `branch-update` (clean base-merge by `update_branch.sh`,
-  applied with NO `--push`), `lint`/`validate` auto-format (`fix_lint.sh`, confirmed passing
-  locally). These ship in the cycle's single push without asking.
+- **Safe / deterministic, no gate:** `branch-update` only (clean base-merge by
+  `update_branch.sh`, applied with NO `--push`). This is the single fix that ships in the
+  cycle's push without asking.
 - **Pre-test `fixed-locally` (systematic-debugging subagent) → Stage 4 gate by default**
-  (verified green locally; low-risk approval). Auto-push opt-in:
-  `PR_WATCHDOG_AUTOPUSH_PREBUILD=1`. On approval it joins the same batch push.
+  (verified green locally; low-risk approval). This covers lint/format/validate too — the
+  subagent owns those fixes (it may run `fix_lint.sh`); the loop never applies them inline.
+  Auto-push opt-in: `PR_WATCHDOG_AUTOPUSH_PREBUILD=1`. On approval it joins the same batch push.
 - **Test-stage code fixes (`pr-failure-handler`) → always Stage 4 gate.** On
   `apply_push`/`commit_and_push` they join the batch; on `skip` they stay unpushed.
 

@@ -49,6 +49,10 @@ Forensic, not destructive:
   suite registry — not even to make the failure stop being observed (that is a bypass; see
   below).
 - Do **not** re-trigger builds or post PR comments. The loop owns triggering.
+- Do **not** run image-based system/E2E tests locally — no `jenkins_make_config`, no
+  container/topology spin-up, no `pytest`, no routing `test-running` runner. Local
+  reproduction is limited to unit/GTest targets via `dbuild` (see "Reproducing locally").
+  For system/E2E failures, RCA is log-based.
 - Edit source **only** within the trivial-fix scope (below), and **only** in `worktree`.
 - Read-only investigation is otherwise unrestricted: Jenkins logs, the PR diff
   (`git -C <worktree> diff <base_branch>...HEAD`), the failing test source, blame output.
@@ -60,9 +64,9 @@ Law applies to you: no fix and no classification before root cause. Use Phases 1
 (root-cause investigation, pattern analysis, single hypothesis) to reach the answer; for a
 deep stack use its root-cause-tracing. Your "verify" step is a defensible classification
 plus, on `trivial`, one minimal patch in the worktree, or, on `non-trivial`, a
-root-cause-first Suggested Fix. If you choose to **reproduce or verify the failing test
-locally**, you MUST first import the latest images — see "Running a test locally" below.
-The bindings below adapt its phases to a CI test failure.
+root-cause-first Suggested Fix. You may **reproduce or verify a failure locally only for
+unit / GTest targets** (never e2e/system tests) — see "Reproducing locally" below. The
+bindings below adapt its phases to a CI test failure.
 
 Investigate until you can answer:
 
@@ -133,32 +137,30 @@ the suite. A bypass is **never `trivial`** and **never the primary recommendatio
 it only in a separate last-place "Last-resort bypass (requires user opt-in)" section, after
 the root-cause fix. Applying a bypass to the worktree is a hard contract violation.
 
-## Running a test locally (import images first — mandatory)
+## Reproducing locally (unit tests only — never e2e/system tests)
 
-This applies **only to image-based system/E2E tests**. A unit/GTest target (built locally via
-`dbuild`, per the routing compilation rule) and any build/lint/pre-build command do **not**
-need image import — skip `jenkins_make_config` for those.
+This handler is **not allowed to run image-based system/E2E tests**: no topology spin-up, no
+image import (`jenkins_make_config`), no routing `test-running` runner, no `pytest`
+invocation. For a system/E2E test failure you do **log-based RCA only** — read the Jenkins
+stage log, the failing test source, `--test-lookup --blame`, and the PR diff — and form your
+classification from that evidence.
 
-A DNOS system/E2E test runs against a built image, so before you run such a test locally
-(to reproduce a failure or verify a fix) you MUST import the latest images via
-`jenkins_make_config`, using the relevant **Israel** Jenkins build link. The parent passes
-`jmc_command` (and `israel_jenkins_url`); if not, resolve it yourself with the watchdog
-script:
+You **may** reproduce or verify a failure locally **only** when it is a **unit / GTest
+target** that builds and runs entirely locally via `dbuild` (per the routing compilation
+rule) and needs no image or live topology. Build/run it from inside `worktree`:
 
 ```
-python3 <pr-watchdog>/scripts/pr_watchdog.py jmc --pr <pr>          # prints the resolved Israel URL + command
-python3 <pr-watchdog>/scripts/pr_watchdog.py jmc --pr <pr> --run    # runs script/jenkins_make_config.sh <israel-url>
+dbuild make <test_target>                                            # builds + runs the target
+dbuild run -- .../cmake_build/test/<test_target> --gtest_filter=*X*  # run a pre-built target with a filter
 ```
 
-- The Israel server is the one that builds + smoke-tests the image; `jmc` prefers a PASSED
-  Israel build (artifacts ready). The underlying `script/jenkins_make_config.sh` needs
-  `$prod_root` set in the environment. If `jmc` reports `no-israel-server` or only a
-  non-PASSED build, the image isn't ready — say so and do not run the test against a
-  stale/missing image.
-- Only after `jenkins_make_config` succeeds, run the system/E2E test via its suite runner.
-  (Unit/GTest targets need no image import — run them directly per the routing rule.)
-- Reproducing a test locally does **not** relax the contract: a non-trivial fix is still
-  non-trivial, and the parent loop still owns the push.
+(Targets such as `isisTests`, `libsrTests`, `libcppTests`, `ospfdTests` live under
+`services/control/quagga/`; see `AI/rules/routing/compilation-routing.mdc`.)
+
+If reproducing the failure would require an image, a container, or a live topology, do
+**not** attempt it — fall back to log-based RCA. Reproducing a unit test locally does **not**
+relax the contract: a non-trivial fix is still non-trivial, and the parent loop still owns
+the push.
 
 ## Output contract
 

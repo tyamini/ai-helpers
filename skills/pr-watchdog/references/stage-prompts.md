@@ -32,6 +32,13 @@ For an **analysis** event, include in `body_md`: root cause (one line), classifi
 failures), and the path to `rca/summary.md`. For a `fixed-locally` pre-build result, state
 that the local build/lint command now passes (cite `repro-<n>.log`).
 
+## Worktree-conflict options (Stage 1)
+
+The worktree-conflict recovery prompt (PR branch already checked out elsewhere →
+main-worktree / dedicated-branch / handoff) is **owned by the `worktree` skill** (Workflow
+B). The watchdog invokes that skill at Stage 1 step 4 and records the returned
+`worktree_mode` / `dedicated_branch` / `push_target`; it does not present the prompt itself.
+
 ## Code-fix escalation prompt (Stage 4)
 
 A code fix from a subagent is gated before push. For a **test-stage** fix
@@ -91,7 +98,7 @@ Printed when CI goes green, the user hands off, or a halt fires.
 PR-<pr>: <title>
 Final CI: <PASSED | FAILED | RUNNING(handed-off)>
 Branch: <branch> (base <base_branch>)
-Worktree: <worktree path> (left in place)
+Worktree: <worktree path> (<removed — created by this run | preserved: main checkout | preserved: reused | preserved: handoff | preserved: pending changes>)
 
 ## Pushes made this run
 - cycle <N> — <kind> — <short sha> — <files>     (or "none")
@@ -115,5 +122,7 @@ At cycle <N>, situation <overall>
 Pointing to: <cycle_dir>
 ```
 
-Post-summary invariants (always): do **not** remove the worktree, do **not** push
-uncommitted worktree changes, do **not** delete `~/.pr-watchdog-runs/<run_id>/`.
+Post-summary invariants: remove the worktree **only** when the watchdog created it this run
+and it has no pending changes (Stage 5 cleanup) — otherwise leave it intact (`main`/reused/
+handoff/dirty). Never push uncommitted worktree changes; never delete
+`~/.pr-watchdog-runs/<run_id>/`.
