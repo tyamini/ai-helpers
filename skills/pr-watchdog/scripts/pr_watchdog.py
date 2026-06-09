@@ -140,6 +140,12 @@ def _resolve_pr():
     return {"pr": nums[0] if len(nums) == 1 else None, "branch": branch, "candidates": nums}
 
 
+def _pr_head_sha(pr):
+    """HEAD commit oid for a PR (gh pr view headRefOid is not on all gh builds)."""
+    data = _gh(["api", f"repos/{REPO}/pulls/{pr}"])
+    return data.get("head", {}).get("sha", "")
+
+
 def _servers_from_statuses(statuses):
     """Map GitHub commit statuses to server rows, dedup by context (latest wins)."""
     servers, seen = [], set()
@@ -181,8 +187,8 @@ def cmd_status(args):
         pr, branch_hint = resolved["pr"], resolved["branch"]
 
     view = _gh(["pr", "view", str(pr), "-R", REPO, "--json",
-                "number,title,url,headRefName,baseRefName,headRefOid,mergeStateStatus,isDraft"])
-    sha = view["headRefOid"]
+                "number,title,url,headRefName,baseRefName,mergeStateStatus,isDraft"])
+    sha = _pr_head_sha(pr)
     merge_state = view.get("mergeStateStatus", "")
 
     combined = _commit_status(sha)
@@ -265,8 +271,8 @@ def cmd_jmc(args):
     locally. The Israel server is the one that builds + smoke-tests the image.
     """
     pr = args.pr
-    view = _gh(["pr", "view", str(pr), "-R", REPO, "--json", "headRefOid"])
-    statuses, source = _statuses_with_fallback(pr, view["headRefOid"])
+    sha = _pr_head_sha(pr)
+    statuses, source = _statuses_with_fallback(pr, sha)
     servers = _servers_from_statuses(statuses)
 
     israel = [s for s in servers if s["name"].lower().startswith("israel") and s["host"] and s["build"]]
@@ -299,7 +305,7 @@ def cmd_jmc(args):
 
 def cmd_trigger(args):
     pr = args.pr
-    view = _gh(["pr", "view", str(pr), "-R", REPO, "--json", "headRefOid,mergeStateStatus"])
+    view = _gh(["pr", "view", str(pr), "-R", REPO, "--json", "mergeStateStatus"])
     if view.get("mergeStateStatus") == "BEHIND":
         print(json.dumps({
             "triggered": False, "servers": [],
@@ -309,7 +315,8 @@ def cmd_trigger(args):
 
     # A freshly pushed HEAD has no statuses; fall back to the last commit that had CI to
     # discover the (stable) server contexts. The rebuild comment rebuilds current HEAD.
-    statuses, catalog_source = _statuses_with_fallback(pr, view["headRefOid"])
+    sha = _pr_head_sha(pr)
+    statuses, catalog_source = _statuses_with_fallback(pr, sha)
 
     # Optionally restrict to specific failed servers (by slug); default = all discovered.
     only = set(args.server or [])
