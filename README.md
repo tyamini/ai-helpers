@@ -15,6 +15,7 @@ Personal AI agent helpers — skills, profiles, and rules used by Cursor / codin
 
 | Skill | Description |
 | --- | --- |
+| `skills/multi-executor/` | Validate and execute one or more plans, one subagent per plan (sequential) via /implementation-loop, driving each plan to its pass criteria. |
 | `skills/iked-failure-rca/` | Root-cause analysis for IKEd test failures. |
 | `skills/iked-fix-triage/` | Triage and propose fixes for IKEd failures. |
 | `skills/iked-test-loop/` | Iterative test-fix-retest loop for IKEd (runs each test inline in Stage 2c via a tmux pane + sentinel watcher; dispatches `iked-failure-rca` and `iked-fix-triage` on failure). |
