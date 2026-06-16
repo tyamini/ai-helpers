@@ -30,10 +30,6 @@ plan code itself — the per-plan subagents do.
   plan (implement → review → fix) until exit criteria are met.
 - `.ai/skills/common/git-conventions/SKILL.md` — branch name, commit message,
   and PR/push rules. The work branch and every subagent commit must match it.
-- `.ai/skills/common/workflow-exec/SKILL.md` + `.ai/workflows/dbuild-usage.md`
-  — to identify the compile / unit-test harness each plan needs.
-- `.ai/workflows/dtest-testing.md` — to identify the e2e harness when a plan
-  calls for e2e tests.
 - `cli-escalation-notify` — fired on every event (plan start, plan finish,
   problems). Pushes a Slack DM in CLI context, no-ops in the IDE, never fatal.
 
@@ -57,9 +53,13 @@ plan code itself — the per-plan subagents do.
   stages, or implement it itself — plan size is irrelevant to the
   one-subagent-per-plan rule.
 - **Short prompts; reference the harness by file.** The subagent prompt states
-  the goal, **points to** the harness/coding/testing/commit docs it must read
-  and follow (by path — never transcribe their commands into the prompt), and
-  the status of related plans — nothing more. No step-by-step micromanagement.
+  the goal, **points to** the harness/coding/commit docs it must read and follow
+  (as a bare `label: path` — never transcribe their commands and never add a
+  parenthetical describing a doc's contents), and the status of related plans —
+  nothing more. **Do not restate, summarize, or re-enumerate anything already in
+  the plan or the harness docs** (pass criteria, phases, non-goals, steps,
+  commands, internal mechanics), and **do not list example blockers or example
+  commands**. No step-by-step micromanagement.
 - **Only environment issues are blockers.** A real blocker is an environment
   problem that stops an agent from using tools, editing code, compiling, or
   testing. Anything else (failing logic, wrong test, unclear step) is normal
@@ -78,12 +78,13 @@ For **every** plan, before any execution:
 2. **Files reachable:** verify each referenced file/path exists and is
    readable. Record any missing ones.
 3. **Harness present:** identify the harness **reference doc(s)** each plan
-   needs and confirm they exist and are reachable — the build / unit-test / e2e
-   rule doc(s) or workflow(s), the coding-conventions doc(s), and the commit
-   conventions. Prefer the harness docs the user named for this run; otherwise
-   resolve them from the plan and the repo's workflow/conventions indexes.
-   Record the **paths** to these docs — not transcribed commands. The subagent
-   reads them itself.
+   needs (build / unit-test / e2e, coding conventions) and confirm they exist
+   and are reachable, plus the commit conventions (`git-conventions`). Take the
+   harness docs **only from the user's input for this run or from the plan** —
+   do not discover them from repo workflow/conventions indexes. Reference the
+   **minimal** set: when a subsystem-specific doc already covers a harness, do
+   not add a generic one on top. Record the **paths** only — not transcribed
+   commands. The subagent reads them itself.
 4. **Companion skills reachable:** resolve every skill listed under
    [Companion skills](#companion-skills-read-once-up-front) to its real file —
    **follow symlinks** (a symlinked skill dir is installed, not missing; do not
@@ -165,29 +166,23 @@ harness lines that this plan does not use.
 
 ```
 Run the /implementation-loop skill to execute the entire plan at <PLAN_PATH>.
-Your acceptance criteria ARE the plan's pass/acceptance criteria — pass them to
-/implementation-loop as its explicit input. If the plan has no explicit,
-testable pass criteria, stop and report it; do not infer them. Do not stop
-until ALL of those criteria are satisfied and verified.
+Use the plan's pass/acceptance criteria as your acceptance criteria (read them
+from the plan). If the plan has no explicit, testable pass criteria, stop and
+report it.
 
-Harness — read these files and follow them exactly (validated and reachable;
-do not ask, do not wait). Do NOT expect commands here; the docs hold them:
-- Build / unit tests / e2e: <harness doc path(s)>
+Read and follow these files:
+- Build / unit / e2e harness: <harness doc path(s)>
 - Coding conventions: <coding-rules doc path(s)>
-- Commit conventions: <git-conventions doc path> — commit on branch <BRANCH>
-  and append [AI generated].
+- Commit conventions: <git-conventions path>; commit on branch <BRANCH>.
 
-You MUST commit before you finish. Committing is part of being done: once the
-criteria pass, commit your work on <BRANCH> per the commit conventions and end
-with a clean working tree (`git status --porcelain` empty). Never return with
-uncommitted changes.
+Commit your work on <BRANCH> before finishing, with a clean tree; do not push
+or open a PR.
 
 Related plans: <none | "<plan> done (commit <sha>)" | "<plan> in progress">.
 
-Only stop early for a real ENVIRONMENT blocker — you cannot use tools, edit
-code, compile, or run tests because of infra. Report any such blocker
-verbatim. For anything else (failing logic, wrong test, unclear step), keep
-working until the criteria pass and you have committed.
+Only stop early for a real environment blocker (infra prevents using tools,
+editing, compiling, or testing); report it verbatim. Otherwise keep working
+through failures until the criteria pass and you have committed.
 ```
 
 ## Blocker policy
@@ -232,8 +227,9 @@ execution_loop_report:
 [ ] Every plan was read in full; pass criteria, referenced files, needed
     harness, and inter-plan dependencies were extracted.
 [ ] All referenced files were verified reachable; every required harness
-    doc/file path was identified and verified reachable before any execution
-    (paths only — commands are never transcribed).
+    doc/file path (taken only from the user's input or the plan, minimal set)
+    was identified and verified reachable before any execution (paths only —
+    commands are never transcribed).
 [ ] Clarification questions (if any) were consolidated into one ask; the
     common case asked nothing.
 [ ] A single work branch was created per `git-conventions` on the confirmed
@@ -245,8 +241,10 @@ execution_loop_report:
 [ ] No plan was reclassified as an "epic", split into stages, or implemented
     by the executor itself — one plan file mapped to exactly one subagent.
 [ ] Each subagent prompt was short: goal + harness referenced **by file path**
-    (coding/testing/commit docs, never transcribed commands) + related-plan
-    status; no step-by-step micromanagement.
+    (bare `label: path`, never transcribed commands, no content-describing
+    parentheticals) + related-plan status; nothing already in the plan or docs
+    was restated (pass criteria, phases, non-goals, steps); no example blockers
+    or commands; no step-by-step micromanagement.
 [ ] The executor waited for each subagent and confirmed by git evidence (clean
     tree + HEAD advanced past the recorded baseline) that a real commit landed
     before dispatching the next — not by trusting the subagent's report.
