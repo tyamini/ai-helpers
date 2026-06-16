@@ -1,10 +1,10 @@
 ---
-name: multi-executor
-description: Execute one or more already-written plans end-to-end by dispatching a dedicated subagent per plan, each running via the /implementation-loop skill. First validates that every plan is understood, that all files they reference exist and are reachable, and that every harness they need is present (compile, unit-test, e2e, git-conventions, coding-conventions). Then runs the plans strictly one at a time — one subagent per plan, each told to drive its whole plan until all of its pass criteria pass and to commit when done — waiting for each to finish before starting the next. Fires cli-escalation-notify on every event (plan start, plan finish, problems) and pushes the branch at the end. Use when the user says "execute these plans", "run the multi-executor", "execute plan X and Y", or hands over a set of plan files to be carried out.
+name: execution-loop
+description: Execute one or more already-written plans end-to-end by dispatching a dedicated subagent per plan, each running via the /implementation-loop skill. First validates that every plan is understood, that all files they reference exist and are reachable, and that every harness they need is present (compile, unit-test, e2e, git-conventions, coding-conventions). Then runs the plans strictly one at a time — one subagent per plan, each told to drive its whole plan until all of its pass criteria pass and to commit when done — waiting for each to finish before starting the next. Fires cli-escalation-notify on every event (plan start, plan finish, problems) and pushes the branch at the end. Use when the user says "execute these plans", "run the execution-loop", "execute plan X and Y", or hands over a set of plan files to be carried out.
 disable-model-invocation: true
 ---
 
-# Multi-Executor
+# Execution Loop
 
 ## Goal
 Carry a set of approved plans to completion: validate they are executable
@@ -21,8 +21,9 @@ plan code itself — the per-plan subagents do.
 - **Parent branch** (optional) — the branch the work sits on top of. Defaults
   to the current branch; confirm with the user during validation.
 - **Parallelism** — sequential by default. Run plans in parallel **only**
-  when the user explicitly says so for explicitly-independent plans. Never
-  assume parallelism is safe.
+  when the user explicitly says so. Never assume parallelism is safe; if the
+  user opts in, the consequences (e.g. concurrent commits to the same branch)
+  are the user's responsibility, not something this skill works around.
 
 ## Companion skills (read once, up front)
 - `implementation-loop` — each per-plan subagent runs this skill to drive its
@@ -83,18 +84,31 @@ For **every** plan, before any execution:
    resolve them from the plan and the repo's workflow/conventions indexes.
    Record the **paths** to these docs — not transcribed commands. The subagent
    reads them itself.
-4. **Ordering:** determine execution order and which plans depend on which.
+4. **Companion skills reachable:** resolve every skill listed under
+   [Companion skills](#companion-skills-read-once-up-front) to its real file —
+   **follow symlinks** (a symlinked skill dir is installed, not missing; do not
+   judge presence with a glob that skips symlinks) — and confirm each
+   `SKILL.md` exists and is readable. This includes `cli-escalation-notify`:
+   being installed is a separate fact from its run-time "never fatal" send
+   behavior, so a companion skill that cannot be located up front is a Stage 1
+   finding, not a silent best-effort skip.
+5. **Ordering:** the execution order is exactly the order the user supplied the
+   plans. Do **not** infer or reorder based on dependencies. Record any
+   dependency you notice as information only; use a different order solely when
+   the user explicitly asked for one (or explicitly allowed parallel).
 
 **Gate:** Every plan understood; all referenced files exist and are reachable;
-the concrete command for each required harness is identified and present; the
-execution order is fixed.
+each required harness doc/file is identified and reachable (paths only — never
+transcribed commands); every companion skill resolves to a readable `SKILL.md`;
+the execution order equals the user-supplied order (unchanged unless the user
+specified otherwise).
 
 ### Stage 2: Clarify and set up
 1. **Clarify gaps (should be rare).** If Stage 1 found anything missing or
    ambiguous — unreachable files, an unavailable harness, a plan with no
    testable pass criteria, or a real knowledge gap — present a single
    consolidated set of questions to the user and wait. In CLI context, first
-   dispatch `cli-escalation-notify` (`title: multi-executor — clarification needed`)
+   dispatch `cli-escalation-notify` (`title: execution-loop — clarification needed`)
    as a heads-up; the local question remains the answer channel.
 2. **Work branch.** Confirm the parent branch with the user (default: current),
    then create the run's work branch per `git-conventions`. Verify the
@@ -107,29 +121,37 @@ parent and the tree is clean.
 For each plan in order (sequential unless the user opted into parallel):
 
 1. **Notify start** — dispatch `cli-escalation-notify`
-   (`title: multi-executor — starting plan <name>`).
-2. **Dispatch one subagent** via the Task tool with
+   (`title: execution-loop — starting plan <name>`).
+2. **Record the baseline** — capture the branch HEAD with `git rev-parse HEAD`
+   so the subagent's commit can be confirmed objectively afterwards.
+3. **Dispatch one subagent** via the Task tool with
    `subagent_type: generalPurpose` (blocking; wait for completion) that runs
    the `/implementation-loop` skill, passing the
    [Subagent prompt](#subagent-prompt) verbatim as the Task `prompt`. Do
    **not** pick a specialized subagent type. Reference only the harness that
    *this* plan needs, and state which related plans are already done (with
-   commit sha) or in progress.
-3. **Wait** for the subagent to finish. Do not start the next plan until it
+   commit sha) or in progress. Keep the subagent's agent id — you may need it
+   to resume the same subagent (see Blocker policy).
+4. **Wait** for the subagent to finish. Do not start the next plan until it
    returns.
-4. **On finish** — verify the subagent reports all pass criteria met and that
-   it committed. Record its commit sha. Dispatch `cli-escalation-notify`
-   (`title: multi-executor — finished plan <name>`).
-5. **On a reported problem** — apply the [Blocker policy](#blocker-policy).
+5. **On finish — confirm by evidence, not by self-report.** Check that
+   `git status --porcelain` is empty and that HEAD advanced past the baseline
+   from step 2; capture the new sha with `git rev-parse HEAD`. If the tree is
+   dirty or HEAD did not move, the plan is **not** done — resume the same
+   subagent (see Blocker policy) to commit/finish; do not advance. Once
+   confirmed, dispatch `cli-escalation-notify`
+   (`title: execution-loop — finished plan <name>`).
+6. **On a reported problem** — apply the [Blocker policy](#blocker-policy).
 
-**Gate:** The current plan's subagent reported every pass criterion met **and**
-committed before the next plan's subagent is dispatched.
+**Gate:** The working tree is clean and HEAD advanced past the baseline (a real
+commit landed) for the current plan before the next plan's subagent is
+dispatched.
 
 ### Stage 4: Finalize
 1. After every plan has passed and committed, the executor **pushes** the work
    branch: `git push -u origin <branch>` (never a protected branch — see
    `git-conventions`).
-2. Dispatch `cli-escalation-notify` (`title: multi-executor — run complete`).
+2. Dispatch `cli-escalation-notify` (`title: execution-loop — run complete`).
 3. Print the run report (see Output format). Do **not** open a PR unless the
    user asked for one.
 
@@ -143,15 +165,22 @@ harness lines that this plan does not use.
 
 ```
 Run the /implementation-loop skill to execute the entire plan at <PLAN_PATH>.
-Do not stop until ALL of the plan's pass/acceptance criteria are satisfied and
-verified.
+Your acceptance criteria ARE the plan's pass/acceptance criteria — pass them to
+/implementation-loop as its explicit input. If the plan has no explicit,
+testable pass criteria, stop and report it; do not infer them. Do not stop
+until ALL of those criteria are satisfied and verified.
 
 Harness — read these files and follow them exactly (validated and reachable;
 do not ask, do not wait). Do NOT expect commands here; the docs hold them:
 - Build / unit tests / e2e: <harness doc path(s)>
 - Coding conventions: <coding-rules doc path(s)>
 - Commit conventions: <git-conventions doc path> — commit on branch <BRANCH>
-  and append [AI generated] once the plan's criteria pass.
+  and append [AI generated].
+
+You MUST commit before you finish. Committing is part of being done: once the
+criteria pass, commit your work on <BRANCH> per the commit conventions and end
+with a clean working tree (`git status --porcelain` empty). Never return with
+uncommitted changes.
 
 Related plans: <none | "<plan> done (commit <sha>)" | "<plan> in progress">.
 
@@ -165,11 +194,12 @@ working until the criteria pass and you have committed.
 When a subagent reports a problem, the executor decides:
 - **Not an environment issue** (failing logic, flaky test, unclear step): this
   is normal work. Help the subagent — clarify, point at the right harness/doc,
-  or resume it — and let it keep going until the pass criteria are met. This
-  is not a blocker.
+  or resume **the same subagent** via the Task tool's `resume` (the agent id
+  kept in Stage 3 step 3), never a fresh dispatch — and let it keep going until
+  the pass criteria are met. This is not a blocker.
 - **Real environment issue** the subagent and the executor cannot fix (tools
   unavailable, cannot compile, cannot test, infra down): dispatch
-  `cli-escalation-notify` (`title: multi-executor — blocked: <reason>`), then **pause
+  `cli-escalation-notify` (`title: execution-loop — blocked: <reason>`), then **pause
   the loop and ask the user**. Do not skip the plan or fabricate success.
 
 ## Halt conditions
@@ -183,7 +213,7 @@ Stop and surface to the user (with a CLI notify) when:
 End the run with a concise report:
 
 ```yaml
-multi_executor_report:
+execution_loop_report:
   branch: <work-branch>
   parent: <parent-branch>
   parallel: false|true
@@ -202,7 +232,8 @@ multi_executor_report:
 [ ] Every plan was read in full; pass criteria, referenced files, needed
     harness, and inter-plan dependencies were extracted.
 [ ] All referenced files were verified reachable; every required harness
-    command was identified and confirmed present before any execution.
+    doc/file path was identified and verified reachable before any execution
+    (paths only — commands are never transcribed).
 [ ] Clarification questions (if any) were consolidated into one ask; the
     common case asked nothing.
 [ ] A single work branch was created per `git-conventions` on the confirmed
@@ -216,8 +247,11 @@ multi_executor_report:
 [ ] Each subagent prompt was short: goal + harness referenced **by file path**
     (coding/testing/commit docs, never transcribed commands) + related-plan
     status; no step-by-step micromanagement.
-[ ] The executor waited for each subagent and confirmed pass criteria met +
-    committed before dispatching the next.
+[ ] The executor waited for each subagent and confirmed by git evidence (clean
+    tree + HEAD advanced past the recorded baseline) that a real commit landed
+    before dispatching the next — not by trusting the subagent's report.
+[ ] Execution order matched the user-supplied order; no implicit reordering (a
+    different order or a parallel run happened only on explicit user request).
 [ ] `cli-escalation-notify` fired on plan start, plan finish, and every
     problem.
 [ ] Only environment issues were treated as blockers; everything else was
