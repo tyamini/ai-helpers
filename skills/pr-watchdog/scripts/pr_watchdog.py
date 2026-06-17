@@ -15,22 +15,29 @@ Jenkins never needed GitHub creds.
 Subcommands (JSON on stdout):
   status   Emit one normalized situation JSON for a PR (see references/state-schema.md).
   resolve  Resolve a unique open PR from the current local branch.
+  watch    Block-poll a PR until CI transitions (PASSED/FAILED/behind) or max-runtime,
+           then exit — so a backgrounded run's completion notification wakes the agent
+           even after its turn has ended. Liveness is independent of any agent turn.
   trigger  Post the Jenkins "pipeline please rebuild failed <slug>" PR comment (via gh)
            for every discovered server.
 
 Exit codes:
-  0  success (JSON on stdout)
-  1  hard error (message on stderr) — e.g. gh missing/unauthenticated, PR not found
+  0  success (JSON on stdout) — for `watch`, a WATCH_TRANSITION was reached
+  1  hard error (message on stderr) — e.g. gh missing/unauthenticated, PR not found;
+     for `watch`, too many consecutive poll errors (WATCH_FATAL)
   2  status/resolve: no unique PR could be resolved (JSON with pr=null on stdout)
+  10 watch: max-runtime cap reached before any transition (WATCH_MAXRUNTIME)
 
 Requires: an authenticated `gh` CLI (`gh auth status`).
 """
 import argparse
+import datetime
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 
 REPO = "drivenets/cheetah"
@@ -176,16 +183,8 @@ def cmd_resolve(_args):
     return 0 if result["pr"] is not None else 2
 
 
-def cmd_status(args):
-    pr = args.pr
-    branch_hint = ""
-    if pr is None:
-        resolved = _resolve_pr()
-        if resolved["pr"] is None:
-            print(json.dumps({"pr": None, **resolved, "error": "no-unique-branch-pr"}))
-            return 2
-        pr, branch_hint = resolved["pr"], resolved["branch"]
-
+def _situation(pr, branch_hint=""):
+    """Compute one normalized situation dict for a PR (shared by status + watch)."""
     view = _gh(["pr", "view", str(pr), "-R", REPO, "--json",
                 "number,title,url,headRefName,baseRefName,mergeStateStatus,isDraft"])
     sha = _pr_head_sha(pr)
@@ -223,7 +222,7 @@ def cmd_status(args):
                 "file": t["test_file"], "suite": t["suite"],
             })
 
-    print(json.dumps({
+    return {
         "pr": pr,
         "url": view.get("url", ""),
         "title": view.get("title", ""),
@@ -238,8 +237,82 @@ def cmd_status(args):
         "servers": servers,
         "failed_tests": failed_tests,
         "lint_validate_failures": lint_validate,
-    }))
+    }
+
+
+def cmd_status(args):
+    pr = args.pr
+    branch_hint = ""
+    if pr is None:
+        resolved = _resolve_pr()
+        if resolved["pr"] is None:
+            print(json.dumps({"pr": None, **resolved, "error": "no-unique-branch-pr"}))
+            return 2
+        pr, branch_hint = resolved["pr"], resolved["branch"]
+
+    print(json.dumps(_situation(pr, branch_hint)))
     return 0
+
+
+def _watch_actionable(sit):
+    """Return a transition reason when the situation is terminal/actionable, else None.
+
+    The watcher's job is to block while a build is RUNNING and wake the agent the
+    moment the state actually changes — so silence can never be mistaken for green.
+    """
+    if sit.get("behind"):
+        return "behind"
+    overall = sit.get("overall")
+    if overall == "PASSED":
+        return "passed"
+    if overall == "FAILED" and not sit.get("build_running"):
+        return "failed"
+    return None
+
+
+def cmd_watch(args):
+    """Block-poll a PR until its CI transitions, then exit so a backgrounded run's
+    completion notification wakes the agent. Liveness is independent of any agent turn.
+
+    Stdout is a stream of one-line markers (the background terminal file is the audit):
+      WATCH_POLL <iso> overall=.. running=.. behind=..   (one per poll, flushed)
+      WATCH_TRANSITION <reason> <situation-json>          (exit 0 — agent should act)
+      WATCH_MAXRUNTIME <situation-json>                   (exit 10 — cap hit)
+      WATCH_ERROR <msg>                                   (transient; keeps looping)
+      WATCH_FATAL <msg>                                   (exit 1 — too many errors)
+    """
+    pr = args.pr
+    deadline = time.monotonic() + args.max_runtime
+    consecutive_errors = 0
+    last_sit = None
+    while True:
+        try:
+            sit = _situation(pr)
+            last_sit = sit
+            consecutive_errors = 0
+        except Exception as e:  # noqa: BLE001 - a transient gh/Jenkins blip must not kill the watcher
+            consecutive_errors += 1
+            print(f"WATCH_ERROR {e}", flush=True)
+            if consecutive_errors >= args.error_tolerance:
+                print(f"WATCH_FATAL {consecutive_errors} consecutive poll errors; last: {e}", flush=True)
+                return 1
+            time.sleep(min(args.interval, 60))
+            continue
+
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"WATCH_POLL {now} overall={sit['overall']} "
+              f"running={sit['build_running']} behind={sit['behind']}", flush=True)
+
+        reason = _watch_actionable(sit)
+        if reason is not None:
+            print(f"WATCH_TRANSITION {reason} {json.dumps(sit)}", flush=True)
+            return 0
+
+        if time.monotonic() >= deadline:
+            print(f"WATCH_MAXRUNTIME {json.dumps(last_sit or sit)}", flush=True)
+            return 10
+
+        time.sleep(args.interval)
 
 
 def _pr_commit_shas(pr, limit=20):
@@ -371,6 +444,19 @@ def main():
 
     p_resolve = sub.add_parser("resolve", help="resolve a unique open PR from the local branch")
     p_resolve.set_defaults(func=cmd_resolve)
+
+    p_watch = sub.add_parser(
+        "watch",
+        help="block-poll a PR until CI transitions (PASSED/FAILED/behind) or max-runtime, then exit",
+    )
+    p_watch.add_argument("--pr", type=int, required=True, help="PR number")
+    p_watch.add_argument("--interval", type=int, default=600,
+                         help="seconds between polls while the build is running (default 600)")
+    p_watch.add_argument("--max-runtime", type=int, default=86400, dest="max_runtime",
+                         help="wall-clock cap in seconds before exiting 10 (default 86400 = 24h)")
+    p_watch.add_argument("--error-tolerance", type=int, default=5, dest="error_tolerance",
+                         help="consecutive poll errors tolerated before exiting 1 (default 5)")
+    p_watch.set_defaults(func=cmd_watch)
 
     p_trigger = sub.add_parser("trigger", help="post Jenkins rebuild request (gh pr comment) per server")
     p_trigger.add_argument("--pr", type=int, required=True, help="PR number")

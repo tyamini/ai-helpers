@@ -66,12 +66,24 @@ tokenless HTTP.
 
 - `scripts/pr_watchdog.py status [--pr N]` — emit one `situation.json` (see schema). The
   loop's single source of truth for CI state each cycle.
+- `scripts/pr_watchdog.py watch --pr N [--interval S] [--max-runtime S]` — **block-poll**
+  until CI transitions (PASSED / FAILED / behind) or the wall-clock cap, then exit. Run it
+  as a **backgrounded Shell job** (`block_until_ms: 0`); its completion notification wakes
+  the agent **even after the turn ends**, so a turn ending can't silently kill the watch.
+  Streams `WATCH_POLL` heartbeats; exits `0` with `WATCH_TRANSITION <reason> <json>`,
+  `10` with `WATCH_MAXRUNTIME <json>`, or `1` with `WATCH_FATAL`. This replaces the old
+  in-turn `AwaitShell`-sleep poll loop.
 - `scripts/pr_watchdog.py resolve` — resolve a unique PR from the local branch.
 - `scripts/pr_watchdog.py trigger --pr N [--server SLUG]` — post the Jenkins rebuild request
   (the `pipeline please rebuild failed <slug>` comment) for every discovered server, or just
   `--server` ones.
-- `scripts/update_branch.sh --check|--apply <wt> <base> [--push]` — detect / fix
-  "branch behind base" (merges `origin/<base>`; pushes on `--apply --push`).
+- `scripts/update_branch.sh --check|--apply <wt> <base> [--push] [--keep-conflict]` — detect /
+  fix "branch behind base" **and surface base↔branch merge conflicts**. `--apply` merges
+  `origin/<base>` (pushes on `--push`). A clean merge (`ACTION=merged`) is the one
+  auto-pushable reconcile; on conflict (`ACTION=conflict`, exit 3) it normally aborts, but
+  with `--keep-conflict` it **leaves the conflicted merge in the worktree** and prints
+  `CONFLICT_FILES=...` so the Stage 3m merge-conflict subagent can resolve it instead of the
+  loop halting.
 - `scripts/fix_lint.sh <wt> <category>` — run the repo's auto-formatter/validator for
   `rust|yang|python|generic` and report whether files changed. **Run by the Stage 3a
   `systematic-debugging` subagent** as a candidate lint/format fix, not by the loop itself.
@@ -79,6 +91,14 @@ tokenless HTTP.
 ## Hard invariants
 
 - **One PR per run.** The watchdog watches exactly one PR end to end.
+- **Watch liveness is independent of the agent turn.** The RUNNING-wait is NOT an in-turn
+  sequence of `AwaitShell` sleeps (a turn ending — model stop, harness turn cap,
+  interruption — would silently kill it, as happened in run `20260616-162322`). Instead run
+  `pr_watchdog.py watch` as a **backgrounded Shell job** that exits on a real CI transition;
+  the harness's background-completion notification wakes the agent to act. **Silence is never
+  success** — any watcher exit that is NOT a `WATCH_TRANSITION` (max-runtime, fatal, or the
+  job vanishing) MUST notify the user via `cli-escalation-notify`; never assume green because
+  no event arrived.
 - **GitHub via `gh` only.** All GitHub reads/writes use the authenticated `gh` CLI — never
   a PAT, `~/.cursor/mcp.json`, or the GitHub MCP. (Jenkins detail is tokenless HTTP; `git`
   push/merge use the normal git remote.)
@@ -98,17 +118,38 @@ tokenless HTTP.
   base-merge on its own) that would burn a rebuild before the failure is actually fixed, and
   would also push the last CI-bearing commit out of reach.
 - **Order within the batch depends on the failure type:**
-  - **Build / pre-build failure (or behind-only):** base-merge **first**, then the build fix
-    — so the fix builds on the updated base (build/lint verification doesn't depend on a
-    Jenkins image).
+  - **Build / pre-build failure (or reconcile-only):** base-merge **first** (resolving any
+    conflict via Stage 3m), then the build fix — so the fix builds on the updated base
+    (build/lint verification doesn't depend on a Jenkins image).
   - **Test failure:** fix the **test first**, then base-merge. Any local verification the
     handler does (unit/GTest only) runs against the **current HEAD** under test; merging base
     first would change the worktree source out from under that verification. Merge only after
     the test fix is in.
+- **Reconcile with base before any push or rebuild.** A branch that is behind base **or
+  conflicted with it** is NOT mergeable and must be reconciled before the watchdog pushes a
+  fix or triggers a build. `behind` and `dirty` are **distinct** GitHub states: a conflicted
+  PR reports `merge_state_status == DIRTY` (`mergeable_state` ∈ {`behind`,`dirty`}), **not**
+  `behind` — so NEVER gate base reconciliation on `behind` alone (doing so misses conflicted
+  PRs, as happened on PR 96575). Treat `needs-base-reconcile = behind == true OR
+  merge_state_status == DIRTY`. The base-merge (and, on conflict, the resolution) is part of
+  the Stage 3 batch and lands in the single Stage 3c push; never push/trigger an unreconciled
+  branch.
+- **Merge conflicts are resolved, not halted-on.** A base-merge conflict is handed to the
+  **merge-conflict subagent** (Stage 3m), never resolved by the loop itself. **Trivial**,
+  intent-preserving conflicts (both-added includes/decls/registrations, adjacent
+  non-overlapping hunks, import/whitespace ordering, generated files/lockfiles) are resolved
+  in the worktree and ride along with the base-merge into the Stage 3c push **without a
+  separate gate** (they are part of the safe reconcile). **Non-trivial** conflicts
+  (overlapping edits to the same logic, semantic divergence, a design call) are escalated via
+  the **regular Stage 4 gate**. HALT `branch-merge-conflict` ONLY when a non-trivial conflict
+  is declined (Stage 4 handoff) or the subagent is blocked — never on the mere existence of a
+  conflict.
 - **Auto-push only the safe deterministic fix** — a clean base merge (branch-update) by
-  `update_branch.sh`. Every source fix (lint/format, pre-build, validation, test) is produced
-  by a subagent and is **never** auto-pushed by default; it goes through the Stage 4
-  escalation gate (the pre-build auto-push opt-in in Notes is the only exception).
+  `update_branch.sh`, plus any **trivial** conflict resolution applied during that merge by
+  the Stage 3m subagent. Every other source fix (lint/format, pre-build, validation, test,
+  and any **non-trivial** conflict resolution) is produced by a subagent and is **never**
+  auto-pushed by default; it goes through the Stage 4 escalation gate (the pre-build
+  auto-push opt-in in Notes is the only exception).
 - **Never edit CI config to make a failure pass.** No touching workflows, deselect lists,
   the suite registry, or test-stage selection just to go green.
 - **Investigation/fixing is always a subagent; the loop never edits source files itself.**
@@ -152,20 +193,49 @@ tokenless HTTP.
 **Gate:** `meta.json` exists, the PR is resolved, the worktree is ready and synced to
 `origin/<branch>`, CLI context is recorded.
 
-### Stage 2: Watch loop (continuous)
+### Stage 2: Watch loop (continuous, via the backgrounded `watch` process)
 
-For each cycle (index `NNN`, starting 0): run `scripts/pr_watchdog.py status --pr <pr>`,
-write `cycles/<NNN>-<situation>/situation.json`, then branch on the situation. Each poll,
-union the `servers[].slug` into `meta.json.known_server_slugs` (so a later trigger can fall
-back to them after a base-merge clears HEAD's statuses). Notify via `cli-escalation-notify`
-only when this cycle's classification differs from `meta.json.last_overall` or an action is
-taken (use the titles in `stage-prompts.md`).
+A cycle is one **observation → branch** step. The observation comes from one of two
+sources, both `pr_watchdog.py`:
 
-- **`PASSED`** → notify "PR is green", go to Stage 5.
-- **`behind == true` or `FAILED`** (with a build present) → go to **Stage 3 (Remediate)**,
-  which batches the base-merge (if behind) and the failure fix locally and pushes once. Do
-  **not** merge-and-push the base here on its own — that is the partial-push mistake the
-  batching invariant forbids.
+- **Active checks** (a quick `status --pr <pr>` snapshot) when you need an immediate read —
+  at Stage 1's end, right after a `trigger`, or to confirm a build registered.
+- **Blocking wait** via the backgrounded `watch --pr <pr> --interval <interval>` process
+  while a build is RUNNING. **Do not** sit in-turn on `AwaitShell` sleeps re-polling — that
+  loop dies if the turn ends and silently stops watching. Instead:
+  1. Launch `watch` as a background Shell job (`block_until_ms: 0`); record its
+     `meta.json.watcher = {pid, started_at, interval, max_runtime}`. End the turn — the
+     watcher keeps polling on its own.
+  2. When the background job **completes**, the harness notifies you. Read the tail of its
+     terminal output and branch on the **last `WATCH_*` line**:
+     - `WATCH_TRANSITION <reason> <json>` → use that situation as this cycle's observation
+       (`reason` ∈ `passed|failed|behind`) and branch below.
+     - `WATCH_MAXRUNTIME <json>` → HALT `max-runtime` (notify; the build never finished).
+     - `WATCH_FATAL <msg>` → the watcher hit repeated poll errors → notify
+       `watcher stopped`, do one `status` snapshot, and either relaunch `watch` or HALT
+       `pr-driver-error` if `status` also fails.
+  3. **Silence is never success:** if the background job ends with no `WATCH_TRANSITION`
+     (vanished, killed, exit you didn't expect), notify `watcher stopped` and re-observe with
+     `status` before deciding — never assume green.
+
+For each cycle write `cycles/<NNN>-<situation>/situation.json`, then branch on the situation.
+Each observation, union the `servers[].slug` into `meta.json.known_server_slugs` (so a later
+trigger can fall back to them after a base-merge clears HEAD's statuses). Notify via
+`cli-escalation-notify` only when this cycle's classification differs from
+`meta.json.last_overall` or an action is taken (use the titles in `stage-prompts.md`).
+
+  Also compute `needs-base-reconcile = behind == true OR merge_state_status == DIRTY`
+  (`mergeable_state` ∈ {`behind`,`dirty`}) from this cycle's `situation.json` — it gates the
+  branches below. A conflicted PR is `dirty`, **not** `behind`, so check both.
+
+- **`PASSED` and not `needs-base-reconcile`** → notify "PR is green", go to Stage 5.
+- **`PASSED` but `needs-base-reconcile`** → the PR is green but **un-mergeable** (behind or
+  conflicted with base) → go to **Stage 3 (Remediate)** to reconcile (base-merge + conflict
+  resolution) before it can merge. Do not treat green-but-dirty as done.
+- **`needs-base-reconcile` or `FAILED`** (with a build present) → go to **Stage 3
+  (Remediate)**, which batches the base-merge (+ conflict resolution if the merge conflicts)
+  and any failure fix locally and pushes once. Do **not** merge-and-push the base here on its
+  own — that is the partial-push mistake the batching invariant forbids.
 - **`NO_CI`** or (`FAILED`/idle and not `build_running`) with nothing to fix → run
   `scripts/pr_watchdog.py trigger --pr <pr>` (subject to the re-trigger guard below). This is
   the path for **any new commit — whether you pushed it or the watchdog pushed a fix**
@@ -184,47 +254,56 @@ taken (use the titles in `stage-prompts.md`).
 a build registers for it (`build_running`/statuses appear) or a cooldown elapses
 (`>= interval`). This prevents posting a second `pipeline please rebuild` while the first
 request is still propagating (statuses can take a minute or two to appear after triggering).
-- **`RUNNING`** / `build_running` → wait `interval` (use `AwaitShell` with no shell_id to
-  sleep), then next cycle. No notify unless this is the first transition into RUNNING.
+- **`RUNNING`** / `build_running` → **launch (or keep) the backgrounded `watch` process**
+  and end the turn; resume when it completes (per the two sources above). Do NOT poll in-turn
+  with `AwaitShell` sleeps. No notify unless this is the first transition into RUNNING. If a
+  quick `status` right after a `trigger` still shows `NO_CI` (statuses not yet registered),
+  do a short bounded wait for them to appear before launching `watch`, then launch it.
 
 (The `behind`/`FAILED` → Stage 3 route is the second bullet above.)
 
 Record `action.json` each cycle.
 
-**Gate:** `situation.json` + `action.json` written; the loop either advanced, slept, took
-a deterministic action, or escalated.
+**Gate:** `situation.json` + `action.json` written; while a build is RUNNING the wait is
+owned by a **backgrounded `watch` process** (not in-turn `AwaitShell` sleeps), and the loop
+either advanced on a `WATCH_TRANSITION`, took a deterministic action, escalated, or notified
+`watcher stopped` on any non-transition exit (silence is never treated as success).
 
 ### Stage 3: Remediate (batch local fixes, then one push + rebuild)
 
-Entered when `behind == true` or `overall == FAILED`. Assemble **all** currently-known
-fixes into the worktree **without pushing**, then land them with a single push + rebuild
-(Stage 3c). Per the batching invariant, nothing is pushed until the batch is complete. The
-**base-merge** is `scripts/update_branch.sh --apply <wt> <base>` — **without `--push`**
-(merges `origin/<base>` locally only; clean → continue, exit 3 → HALT
-`branch-merge-conflict`).
+Entered when `needs-base-reconcile` (behind or dirty) or `overall == FAILED`. Assemble
+**all** currently-known fixes into the worktree **without pushing**, then land them with a
+single push + rebuild (Stage 3c). Per the batching invariant, nothing is pushed until the
+batch is complete. The **base-merge** is `scripts/update_branch.sh --apply <wt> <base>
+--keep-conflict` — **without `--push`** (merges `origin/<base>` locally only): clean
+(`ACTION=merged`) → continue; conflict (`ACTION=conflict`, exit 3) → the conflicted merge is
+**left in the worktree** with its `CONFLICT_FILES`, which go to **Stage 3m (merge-conflict
+resolution)** — NOT a halt.
 
 #### Stage 3 Step 0: classify the failure (if FAILED)
 
 Read `situation.json` and classify the failing stage as **pre-test** vs **test** — this
 decides the order of merge vs fix:
 
-- **pre-test** (build/pre-build) or **behind-only** → **base-merge first, then fix** (Step 1A).
+- **pre-test** (build/pre-build) or **reconcile-only** (behind/dirty, no failure) →
+  **base-merge first, then fix** (Step 1A).
 - **test** → **fix the test first, then base-merge** (Step 1B), because the local test
   verification needs the Jenkins image that matches the current CI commit.
 
 #### Stage 3 Step 1: apply fixes in the type-dependent order
 
-**1A — build / pre-build failure, or behind-only:**
-1. If `behind`, run the base-merge now (no `--push`). If behind-only (no `FAILED`), skip to
-   Stage 3c.
+**1A — build / pre-build failure, or reconcile-only:**
+1. If `needs-base-reconcile` (behind or dirty), run the base-merge now (no `--push`); on a
+   conflict resolve it via **Stage 3m** before continuing. If this is a reconcile-only cycle
+   (no `FAILED`), skip to Stage 3c once the merge is clean/resolved.
 2. Then fix the pre-build/build failure locally (routing below), building on the merged base.
 
 **1B — test failure:**
 1. Fix/verify the test **first** (dispatch `pr-failure-handler`, Stage 3b — it does log-based
    RCA, reproducing locally only for unit/GTest targets, never e2e/system tests). Do **not**
    merge base yet.
-2. **After** the test fix is in the worktree, if `behind`, run the base-merge (no `--push`)
-   on top of it.
+2. **After** the test fix is in the worktree, if `needs-base-reconcile`, run the base-merge
+   (no `--push`) on top of it; on a conflict resolve it via **Stage 3m**.
 
 Routing for the fix itself (used by 1A/1B):
 
@@ -344,6 +423,44 @@ Branch:
 **Gate:** the relevant subagent's artifacts are present; an analysis event was notified;
 fixes (if any) are applied in the worktree, unpushed, awaiting Stage 3c / the Stage 4 gate.
 
+#### Stage 3m: Merge-conflict resolution (subagent)
+
+Entered when the Step 1 base-merge returns `ACTION=conflict` (run with `--keep-conflict`, so
+the conflicted merge is left in the worktree). The loop **never resolves conflicts itself** —
+dispatch a **generalPurpose Task subagent** to resolve them in the worktree and classify each.
+
+Pass: `worktree`, `branch`, `base_branch`, the `CONFLICT_FILES` list, and `cycle_dir` (write
+artifacts under `<cycle_dir>/merge/`). Instruct it to:
+- For each conflicted hunk, decide **trivial** (mechanical, intent-preserving: both-sides-added
+  includes/declarations/registrations, adjacent non-overlapping hunks, import/whitespace
+  ordering, regenerated/generated files, lockfiles) vs **non-trivial** (overlapping edits to
+  the same logic, semantic divergence, anything needing a design call).
+- Resolve **all trivial** conflicts in the worktree keeping **both** sides' intent, `git add`
+  the resolved files. Do **not** commit or push (the loop owns that via Stage 3c).
+- If **any** conflict is non-trivial, do not guess: leave those files conflicted (resolve only
+  the trivial ones) and write `<cycle_dir>/merge/suggested-resolution.md` (the conflicting
+  hunks + recommended resolution as a ready-to-apply diff).
+- **Never** resolve by deleting a side's feature, reverting the PR's commits, `--ours`/`--theirs`
+  blanket-picking, or editing CI/test selection to dodge the conflict.
+
+Return: per-file classification, `all_trivial` (bool), `touched_paths`, and
+`suggested_resolution_path` (set when any non-trivial). **Always notify** "analysis complete".
+
+Branch on the result:
+- **`all_trivial`** → the resolved base-merge rides the safe reconcile: it joins the batch and
+  lands via **Stage 3c with no separate gate** (per the conflict invariant — trivial,
+  intent-preserving resolution is part of the base reconcile). Notify "merge conflicts
+  resolved".
+- **any non-trivial** → **Stage 4 gate** (regular escalation): present the suggested-resolution
+  (`apply_push` / `commit_and_push` / `handoff` / `skip`). On approval, apply the diff in the
+  worktree, `git add`, and land via Stage 3c. On `handoff` → HALT `branch-merge-conflict`. On
+  `skip` → abort the in-progress merge (`git -C <wt> merge --abort`) and continue; note the PR
+  stays un-mergeable (cannot reach green-and-mergeable until reconciled).
+
+**Gate:** either the merge is fully resolved (all trivial, or non-trivial approved) and staged
+for the Stage 3c push, or it was escalated/halted; the worktree is never left with stray
+conflict markers heading into a push.
+
 #### Stage 3c: Land the batch — one push + rebuild
 
 After Step 0 and Step 1 have applied everything actionable to the worktree (and any required
@@ -410,18 +527,26 @@ per the rules above); loop returns.
 The loop stops and surfaces the situation when one fires. In CLI context, dispatch
 `cli-escalation-notify` (`title: pr-watchdog — halted: <halt_code>`) for halts that need
 the user (`branch-merge-conflict`, `worktree-conflict`, handler `blocker`, user `handoff`,
-`max-runtime`). Skip notifying the Stage-1-only halts (`no-unique-branch-pr`).
+`max-runtime`, `watcher-stopped`). Skip notifying the Stage-1-only halts (`no-unique-branch-pr`).
 
 - `gh-not-authenticated` — `gh auth status` failed; GitHub access is `gh`-only.
 - `no-unique-branch-pr` — branch maps to zero/multiple open PRs.
 - `worktree-conflict` — the `worktree` skill reported the PR branch is already checked out
   elsewhere (its `make_worktree.sh` exit 3) and the user declined both recovery options
   (main-worktree / dedicated-branch), choosing handoff. HALT only in that case.
-- `branch-merge-conflict` — `update_branch.sh --apply` exit 3 (base merge conflicts).
+- `branch-merge-conflict` — a base-merge conflict could **not** be auto-resolved: the Stage 3m
+  merge-conflict subagent found a **non-trivial** conflict and the user chose `handoff` at the
+  Stage 4 gate, or the subagent returned a `blocker`. A merely *detected* conflict is NOT a
+  halt — trivial conflicts are resolved inline and non-trivial ones are escalated first.
 - `pr-driver-error` — `pr_watchdog.py status` exits 1 (e.g. bad creds, PR not found).
 - Handler returned `blocker:` (e.g. log fetch failed).
 - User chose **(c) Hand off** at a Stage 4 gate.
-- `max-runtime` — exceeded a sensible wall-clock cap (default 24h, mirroring pr_driver).
+- `max-runtime` — the backgrounded `watch` exited `WATCH_MAXRUNTIME` (wall-clock cap, default
+  24h) before the build ever finished. Notify, then HALT.
+- `watcher-stopped` — the backgrounded `watch` ended without a `WATCH_TRANSITION`
+  (`WATCH_FATAL`, killed, or vanished). This is **not** silently ignored: notify
+  `watcher stopped`, re-observe via `status`, and either relaunch `watch` or HALT
+  `pr-driver-error` if `status` also fails.
 
 In every halt: persist state to `meta.json`, print the halt-summary variant, and run the
 Stage 5 worktree cleanup (remove the worktree only if the watchdog created it this run and it
@@ -445,9 +570,11 @@ A markdown summary (Stage 5 shape) plus the `~/.pr-watchdog-runs/<run_id>/` tree
 - [ ] The PR was resolved (from `--pr` or the unique branch PR); a single PR was watched end to end.
 - [ ] Every fix landed in the worktree, never the user's main checkout.
 - [ ] Only the clean base-merge (branch-update) was auto-pushed without a gate; every source fix (lint/validate/pre-build/test) came from a subagent and went through the Stage 4 user gate (unless the pre-build auto-push opt-in was set).
+- [ ] The branch was reconciled with base before any push/trigger: `needs-base-reconcile` (behind OR `merge_state_status == DIRTY`) routed to Stage 3 — a green-but-dirty PR was never treated as done. Base-merge conflicts went to the Stage 3m subagent (trivial resolved inline + landed with the merge, non-trivial escalated via the Stage 4 gate); a conflict was never silently halted-on or pushed unreconciled.
 - [ ] Pre-build failures were ALWAYS handed to the `systematic-debugging` subagent; the loop never attempted an inline pre-build/lint fix.
 - [ ] CI config / workflows / suite registry / test-stage selection were never edited to force green.
 - [ ] Deterministic flows ran via the scripts; pre-test failures went to a generic `systematic-debugging` subagent (local fix-until-pass) and test failures to `pr-failure-handler`.
+- [ ] The RUNNING-wait used the backgrounded `pr_watchdog.py watch` process (not in-turn `AwaitShell` sleeps); the agent resumed on its completion notification. Every non-`WATCH_TRANSITION` watcher exit (max-runtime / fatal / vanished) produced a `watcher stopped` notification — silence was never treated as green.
 - [ ] In CLI context, a Slack event fired for each PR event and each analysis (state transitions/actions, not every identical poll), via `cli-escalation-notify`; status recorded in `meta.json`.
 - [ ] Commits used `git-conventions` (with `[AI generated]`); no `git add -A`; protected branches never pushed to directly.
 - [ ] On finish, a watchdog-created worktree (`worktree_created`, non-`main`, no pending changes) was removed via the `worktree` skill; `main`/reused/handoff/dirty worktrees were left intact. The run dir always persisted; nothing was force-pushed or reverted.

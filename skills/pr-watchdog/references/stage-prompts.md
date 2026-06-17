@@ -20,12 +20,32 @@ Event titles (one per event class):
 
 - `pr-watchdog — build triggered (PR <pr>)`
 - `pr-watchdog — branch updated to base (PR <pr>)`
+- `pr-watchdog — merge conflicts resolved (PR <pr>)`  ← Stage 3m subagent resolved trivial base↔branch conflicts
 - `pr-watchdog — lint/validate auto-fixed & pushed (PR <pr>)`
 - `pr-watchdog — CI failed, investigating (PR <pr>)`
 - `pr-watchdog — pre-build fixed locally, cycles <n>/3 (PR <pr>)`  ← systematic-debugging subagent fixed-locally
 - `pr-watchdog — analysis complete (PR <pr>)`  ← every subagent result
 - `pr-watchdog — PR is green (PR <pr>)`
+- `pr-watchdog — watcher stopped (PR <pr>)`  ← background `watch` exited WITHOUT a transition
 - `pr-watchdog — halted: <halt_code> (PR <pr>)`
+
+### Background `watch` process (Stage 2)
+
+The RUNNING-wait is a backgrounded `pr_watchdog.py watch` job, not in-turn `AwaitShell`
+sleeps (a turn ending would otherwise silently kill the watch — the failure mode from run
+`20260616-162322`). Its stdout (captured in the background terminal file) is a stream of
+one-line markers; branch on the **last** one when the job completes:
+
+- `WATCH_POLL <iso> overall=.. running=.. behind=..` — one heartbeat per poll (progress only).
+- `WATCH_TRANSITION <reason> <situation-json>` — exit 0; `reason` ∈ `passed|failed|behind`.
+  Use the JSON as the cycle's observation and run the Stage 2 branch.
+- `WATCH_MAXRUNTIME <situation-json>` — exit 10; HALT `max-runtime` (notify).
+- `WATCH_FATAL <msg>` — exit 1 (repeated poll errors); notify `watcher stopped`, re-observe
+  with `status`, relaunch or HALT.
+
+**`watcher stopped` body** — include: how it ended (`WATCH_FATAL` / max-runtime / vanished),
+the last `WATCH_POLL` line seen, and that watching is paused until you relaunch `watch` or
+the user re-engages. Silence must never be read as green.
 
 For an **analysis** event, include in `body_md`: root cause (one line), classification (or
 `fixed-locally`/`needs-escalation` for pre-build), relatedness to the PR's own changes (test

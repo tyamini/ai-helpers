@@ -11,7 +11,7 @@ always-loaded prompt.
   meta.json                # run-level state (below)
   worktree                 # one-line file: abs path to the fix worktree
   cycles/
-    <NNN>-<situation>/     # NNN = zero-padded cycle index; situation = passed|running|failed|behind|no-ci
+    <NNN>-<situation>/     # NNN = zero-padded cycle index; situation = passed|running|failed|behind|dirty|no-ci
       situation.json       # verbatim `pr_watchdog.py status` output for this cycle
       action.json          # what the watchdog did this cycle (below)
       rca/                 # only when a failure was investigated (subagent artifacts)
@@ -50,9 +50,16 @@ Written at Stage 1; updated at every push / escalation / event.
   ],
   "known_server_slugs": ["israel1", "israel3", "aws5", "aws6", "aws7", "aws8"],
   "last_trigger": {"sha": "<HEAD sha a rebuild was requested for>", "at": "<ISO-8601>"},
+  "watcher": {"pid": 12345, "started_at": "<ISO-8601>", "interval": 600, "max_runtime": 86400, "last_exit": "transition | maxruntime | fatal | null"},
   "last_escalation_notify": "sent | skipped | send-failed | null"
 }
 ```
+
+`watcher` records the backgrounded `pr_watchdog.py watch` job that owns the RUNNING-wait
+(Stage 2). Its liveness is **independent of the agent turn**: the job keeps polling after the
+turn ends and wakes the agent via the harness background-completion notification. `last_exit`
+distinguishes a clean `WATCH_TRANSITION` (`transition`) from the cases that MUST notify
+`watcher stopped` (`maxruntime`, `fatal`, or the job vanishing → recorded by the agent).
 
 `is_cli_context == true` iff `$CURSOR_AGENT` is set AND `$CURSOR_LAYOUT` is unset
 (matches `cli-escalation-notify`). Do NOT also gate on `$VSCODE_AGENT_FOLDER`.
@@ -78,6 +85,7 @@ Verbatim stdout of `scripts/pr_watchdog.py status --pr <pr>`:
   "overall": "NO_CI | RUNNING | PASSED | FAILED",
   "build_running": true,
   "behind": false,
+  "merge_state_status": "CLEAN | BEHIND | DIRTY | BLOCKED | UNSTABLE | ...",
   "mergeable_state": "clean | behind | dirty | blocked | unstable | ...",
   "draft": false,
   "servers": [{"name": "Israel-1", "state": "FAILED", "build": "123", "duration": "", "stage": "Lint & Validate"}],
@@ -92,14 +100,20 @@ Verbatim stdout of `scripts/pr_watchdog.py status --pr <pr>`:
 - `PASSED` — every discovered server PASSED.
 - `FAILED` — no server running and at least one FAILED.
 
+Base reconciliation: `behind` and a conflicted PR are **distinct** signals. GitHub reports a
+conflicted PR as `merge_state_status == DIRTY` (`mergeable_state: dirty`), **not** `behind`.
+The watchdog treats `needs-base-reconcile = behind == true OR merge_state_status == DIRTY`;
+both route to Stage 3 (base-merge, then Stage 3m conflict resolution if the merge conflicts),
+including a green-but-dirty PR.
+
 ## `action.json` — what the watchdog did this cycle
 
 ```json
 {
   "cycle": 3,
   "situation": "failed",
-  "decision": "wait | trigger | update-branch | prebuild-fix | investigate | escalate | done",
-  "fix_kind": "branch-update | prebuild | code-fix | null",
+  "decision": "wait | trigger | update-branch | resolve-conflict | prebuild-fix | investigate | escalate | done",
+  "fix_kind": "branch-update | merge-conflict | prebuild | code-fix | null",
   "prebuild_result": "fixed-locally | needs-escalation | null",
   "cycles_used": 0,
   "auto_pushed": false,
