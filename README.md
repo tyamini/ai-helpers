@@ -8,7 +8,8 @@ Personal AI agent helpers — skills, profiles, and rules used by Cursor / codin
 .
 ├── skills/     # Reusable agent skills (each in its own folder with a SKILL.md)
 ├── profiles/   # Agent profiles
-└── rules/      # Agent rules
+├── rules/      # Agent rules
+└── tools/      # Standalone tooling (services, CLIs) used by skills/agents
 ```
 
 ## Skills
@@ -23,3 +24,11 @@ Personal AI agent helpers — skills, profiles, and rules used by Cursor / codin
 | `skills/ipsec-yang-sync/` | Sync the IPsec YANG/CLI branch from a feature branch. |
 
 Each skill is self-contained; see its `SKILL.md` for usage instructions.
+
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `tools/run-ledger/` | Deterministic, non-LLM observability for orchestration loops: per-machine event recorder + spool/flush, a central Markdown/Obsidian-vault ingest service on `tyamini-dev`, and a timeline CLI. |
+
+See each tool's `README.md` for setup and usage.

@@ -137,9 +137,24 @@ dependency notes.
 2. **Work branch.** Confirm the parent branch with the user (default: current),
    then create the run's work branch per `.ai/skills/common/git-conventions/SKILL.md`. Verify the
    workspace is clean (`git status --porcelain`); if dirty, stop and ask.
+3. **Anchor the run (telemetry).** Once the work branch exists, generate a run id
+   (`run_id="$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"`) and emit one
+   run-start record so the run-ledger's `active.json` is set before any subagent
+   dispatch — this scopes all hook telemetry to *this* run and anchors its agent
+   tree. Fire-and-forget and non-fatal (swallow output/errors):
+   ```
+   ~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py \
+     record --source notify --event run-start \
+     --field run_id="$run_id" --field branch=<work-branch> \
+     --field root_agent_id=<this executor's agent id, if resolvable>
+   ```
+   Subsequent `cli-escalation-notify` events inherit this `run_id` from
+   `active.json` automatically. No run-end plumbing is needed: the recorder ends
+   the run window when it processes the `run_complete` (or `blocked`) event that
+   `cli-escalation-notify` emits at Stage 4 / on halt.
 
 **Gate:** No open questions; the work branch is checked out on the confirmed
-parent and the tree is clean.
+parent, the tree is clean, and the run-start record has been emitted.
 
 ### Stage 3: Execute — one subagent per plan
 For each plan in order (sequential unless the user opted into parallel):

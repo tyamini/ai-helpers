@@ -11,8 +11,8 @@ disable-model-invocation: true
 Tell the user "your agent needs you" via Slack DM when, and only when, the agent is running headless in the cursor-agent CLI. In the Cursor IDE there is no point — the user is by definition looking at the chat panel.
 
 The skill is **fire-and-forget**:
-- Detects context, resolves a Slack target, sends one DM.
-- Never halts the caller. Any failure (no handle, lookup miss, Slack API error, missing tool) is logged and swallowed.
+- Records a structured telemetry event to the run-ledger (step 0), then detects context, resolves a Slack target, sends one DM.
+- Never halts the caller. Any failure (no handle, lookup miss, Slack API error, missing tool, ledger unreachable) is logged and swallowed.
 - Returns a small status object the caller can record for audit.
 
 ## Inputs
@@ -33,11 +33,34 @@ The skill is **fire-and-forget**:
 
 - **Tool availability is observed, never inferred.** The harness may expose the Slack MCP tools under a **prefixed** name (e.g. `dn-mcp-server-slackbot_slack_send_msg` / `dn-mcp-server-slackbot_slack_find_user` rather than the bare `slackbot_slack_*` used in this doc). A tool name that does not match this doc verbatim does **not** mean the tool is absent — match by suffix. Never return `skipped` because you *believe* the Slack integration "isn't available": the only valid skip reasons are the four below (`ide-context`, `no-handle`, `lookup-failed`, `send-failed`), each derived from an **actual** tool result or context check — there is no "tool-not-present" skip. If you are genuinely unsure the Slack wiring is live, make one cheap `slack_test_connection` call and branch on its real result; do not pre-judge.
 - **CLI-only.** When `is_cli_context == false` the skill returns `{status: "skipped", reason: "ide-context"}` without making any tool calls.
-- **Non-fatal.** No failure path raises or halts. Worst case is `{status: "skipped", reason: "<why>"}`.
+- **Non-fatal.** No failure path raises or halts. Worst case is `{status: "skipped", reason: "<why>"}`. The step-0 run-ledger record is likewise non-fatal and independent of the Slack send — its success or failure never affects the returned status.
 - **One DM per call.** No retries, no fan-out to channels, no @-mentions. If the call fails, the parent's interactive prompt is the canonical fallback.
 - **No content authorship.** This skill does not invent text. It prepends a header line and `run_context` lines, then emits `body_md` verbatim, then emits `tail_line`. The parent is responsible for what the user actually reads.
 
 ## Workflow
+
+### 0. Record to the run-ledger (deterministic, non-fatal — runs in both IDE and CLI)
+
+Before the CLI/IDE gate, append one structured telemetry event so every milestone is captured regardless of Slack delivery (this is the semantic-event source for orchestration-run observability). This step is **fire-and-forget**: it must never change the Slack outcome below, never halt, and swallow all output and errors.
+
+- Resolve `run_id` and `host` from the `run_context` lines if present (e.g. `run_id: 20260531-091158-e2fb11`, `host: tyamini-dev2`).
+- Map `title` → `event` (case-insensitive substring match):
+  - `starting plan` → `plan_start`
+  - `finished plan` → `plan_finish`
+  - `blocked` → `blocked`
+  - `directive injected` → `directive_injected`
+  - `run complete` → `run_complete`
+  - `clarification needed` → `clarification`
+  - anything else → `note`
+- Invoke the recorder, passing only the fields that are known (swallow all stdout/stderr; ignore the exit status):
+  ```
+  ~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py \
+    record --source notify --event <mapped> \
+    --field run_id=<run_id> --field host=<host> \
+    [--field plan=<plan>] [--field sha=<sha>] [--field branch=<branch>] \
+    --field detail=<title>
+  ```
+- The recorder is itself fail-open and owns scope: a missing `run_id` or an unreachable central service simply records nothing — never an error. Do **not** make this step conditional on CLI vs IDE; telemetry is wanted in both. Proceed to step 1 regardless of what this step did.
 
 ### 1. Detect context
 

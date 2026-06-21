@@ -1,0 +1,31 @@
+# run-ledger central ingest service (user systemd unit).
+#
+# Install on tyamini-dev (the central host):
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/server/run-ledger.service \
+#          ~/.config/systemd/user/run-ledger.service
+#   # set the shared token (and optionally a vault path) once:
+#   systemctl --user edit run-ledger   # add:  [Service]\n Environment=RUN_LEDGER_TOKEN=...
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now run-ledger.service
+#   loginctl enable-linger "$USER"     # so it runs without an active login session
+#
+# Logs:  journalctl --user -u run-ledger -f
+
+[Unit]
+Description=run-ledger central ingest service (Markdown vault)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.drivenets/cheetah/AI/v2/private/tools/run-ledger/server/app.py
+Restart=on-failure
+RestartSec=3
+# Configure via a drop-in (systemctl --user edit run-ledger):
+#   Environment=RUN_LEDGER_TOKEN=change-me
+#   Environment=RUN_LEDGER_PORT=8723
+#   Environment=RUN_LEDGER_VAULT=%h/obsidian/run-ledger-vault
+
+[Install]
+WantedBy=default.target

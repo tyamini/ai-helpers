@@ -1,0 +1,7 @@
+# run-ledger runtime data: central vault (tyamini-dev), per-machine spool + active.json.
+# Never committed; recreated at runtime. Override location via RUN_LEDGER_VAR / RUN_LEDGER_VAULT.
+tools/run-ledger/var/
+
+# Python bytecode
+__pycache__/
+*.pyc
