@@ -50,7 +50,7 @@ explicitly-marked directive into the agent's chat via
 - `scripts/exec_session.py` — resolve/create the run's tmux session (JSON out).
 - `scripts/exec_dispatch.py` — launch ONE per-plan `cursor-agent` in a tmux window (JSON in/out). Run, do not read.
 - `scripts/watch.sh` — completion-sentinel watcher (`__EXEC_DONE__ rc=`), consumed via `AwaitShell`. Run, do not read.
-- `scripts/exec_collect.py` — parse `agent.json` + git evidence into `verdict.json` (JSON in/out).
+- `scripts/exec_collect.py` — parse `pane.log` (stream-json) + git evidence into `verdict.json` (JSON in/out).
 - `references/run-state.md` — the `~/.exec-runs/<run_id>/` tree and every script's JSON contract.
 - `references/dispatch-prompt.md` — the per-plan agent prompt.
 - The `cursor-agent` CLI must be on `PATH`, and `CURSOR_API_KEY` (or a logged-in session) available to launched processes.
@@ -286,7 +286,7 @@ While a per-plan agent runs, the executor can steer it by resuming its chat via
 `cursor-agent --resume <chat_id> -p "<directive>"` — the same conversation with
 its context preserved, **never a fresh launch** for steering. The `chat_id` is
 the cursor-agent `session_id`, available from `verdict.json` after the agent
-finishes (and, mid-run, from `agent.json` once the agent has emitted it).
+finishes (and, mid-run, from `pane.log` — the stream-json `system/init` line emits it first).
 
 - **Behavior change vs Task subagents — no mid-run preemption.** A headless
   `cursor-agent -p` runs its turn to completion; you cannot interrupt it mid-turn

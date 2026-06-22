@@ -2,7 +2,7 @@
 """Collect a per-plan agent result into a verdict.
 
 Combines the completion return code (from pane.log), the cursor-agent output
-(agent.json, for the chat id), and git evidence (HEAD advanced + clean tree)
+(pane.log stream-json, for the chat id), and git evidence (HEAD advanced + clean tree)
 into a deterministic verdict. The git evidence is authoritative for "done" -
 never the agent's self-report.
 
@@ -34,31 +34,28 @@ def _git(repo: str, *args: str) -> str:
 
 
 def _extract_chat_id(path: str):
+    """Scan the pane log (stream-json events + sentinel) for a session id.
+
+    Every stream-json line carries `session_id`; the first match is enough.
+    """
     if not os.path.exists(path):
         return None
     try:
-        raw = open(path, errors="replace").read().strip()
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(o, dict):
+                for k in ("session_id", "sessionId", "chat_id", "chatId",
+                          "conversation_id", "conversationId"):
+                    if o.get(k):
+                        return o[k]
     except OSError:
         return None
-    if not raw:
-        return None
-    objs = []
-    try:
-        objs = [json.loads(raw)]
-    except json.JSONDecodeError:
-        for line in raw.splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    objs.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-    for o in reversed(objs):
-        if isinstance(o, dict):
-            for k in ("chat_id", "chatId", "session_id", "sessionId",
-                      "conversation_id", "conversationId", "id"):
-                if o.get(k):
-                    return o[k]
     return None
 
 
@@ -71,7 +68,6 @@ def main() -> int:
 
     plan_dir = os.path.join(run_dir(run_id), "plans", slug)
     pane_log = os.path.join(plan_dir, "pane.log")
-    agent_json = os.path.join(plan_dir, "agent.json")
 
     rc = None
     if os.path.exists(pane_log):
@@ -80,7 +76,7 @@ def main() -> int:
             if m:
                 rc = int(m.group(1))  # keep the last sentinel
 
-    chat_id = _extract_chat_id(agent_json)
+    chat_id = _extract_chat_id(pane_log)
 
     head = _git(repo, "rev-parse", "HEAD")
     clean = _git(repo, "status", "--porcelain") == ""

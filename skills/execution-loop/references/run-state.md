@@ -10,9 +10,8 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
   plans/
     <NNN>-<slug>/      # NNN = zero-padded plan index; slug = sanitized plan name
       prompt.txt       # the per-plan agent prompt (from references/dispatch-prompt.md)
-      agent.json       # cursor-agent --output-format json output (one JSON object)
       agent.err        # cursor-agent stderr
-      pane.log         # tee of the wrapped command incl. the completion sentinel
+      pane.log         # live tee of the pane: cursor-agent stream-json events + the completion sentinel
       verdict.json     # evidence-based verdict (below)
 ```
 
@@ -41,9 +40,10 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 
 ### scripts/exec_dispatch.py
 - stdin JSON: `{run_id, slug, plan_path, branch, repo_root, model?, prompt_path?, parent?}`
-- stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "result_path": ".../agent.json", "started_at": "..."}`
-- side effect: opens a new tmux window in the run's session and sends the
-  sentinel-wrapped `cursor-agent` command. Never blocks.
+- stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "result_path": ".../pane.log", "started_at": "..."}`
+- side effect: splits a new tmux pane in the run's session and sends the
+  sentinel-wrapped `cursor-agent` command (stream-json, piped live to the pane
+  via `tee`). Never blocks.
 
 ### scripts/watch.sh
 - args: `<abs path to pane.log>`
@@ -68,7 +68,11 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 - `committed` is the authoritative "done" signal: `head_sha != baseline_sha`
   AND `clean_tree`. `status` is `complete` only when `rc == 0` AND `committed`.
 
-## cursor-agent JSON shape (observed, Cursor 3.8.x)
-`--output-format json` emits one object:
-`{type, subtype, is_error, duration_ms, result, session_id, request_id, usage{...}}`.
-`session_id` is the chat id used for `cursor-agent --resume <session_id>`.
+## cursor-agent output shape (observed, Cursor 3.8.x)
+Dispatch uses `--output-format stream-json --stream-partial-output`, which emits
+one JSON object per line, live: a `system/init` line
+(`{type:"system",subtype:"init",session_id,model,...}`), `assistant` text-delta
+lines, tool-call lines, and a final
+`{type:"result",subtype:"success",result,session_id,usage{...}}`. Every line
+carries `session_id` — the chat id for `cursor-agent --resume <session_id>`.
+`pane.log` is this stream plus the trailing `__EXEC_DONE__ rc=<n>` sentinel.
