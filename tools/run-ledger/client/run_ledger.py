@@ -158,10 +158,18 @@ def _record_event(source: str, name: str, run_id: str, fields: dict) -> int:
         name = (name or "").replace("-", "_")
         source = source or "hook"
 
+        # A process deliberately launched as part of a run (execution-loop's
+        # exec_dispatch.py) carries these in its env. They make this process's
+        # events in-scope by construction and tag their lineage.
+        env_run_id = os.environ.get("RUN_LEDGER_RUN_ID")
+        env_parent = os.environ.get("RUN_LEDGER_PARENT")
+        if env_parent and "parent_session_id" not in fields:
+            fields["parent_session_id"] = env_parent
+
         run_id = run_id or fields.get("run_id") or ""
         active = _read_active()
-        if not run_id and active:
-            run_id = active.get("run_id", "")
+        if not run_id:
+            run_id = env_run_id or (active.get("run_id", "") if active else "")
 
         # run_start anchors the run: write active.json, always record.
         if name == "run_start":
@@ -174,8 +182,13 @@ def _record_event(source: str, name: str, run_id: str, fields: dict) -> int:
                 "ended": False,
                 "ended_at": None,
             })
+        elif env_run_id:
+            # Dispatched child (per-plan agent or its subagents): in scope by
+            # construction. The launch env is authoritative for the run id, and
+            # active.json window gating does not apply.
+            run_id = env_run_id
         else:
-            # Scope decision.
+            # Scope decision for ordinary (non-dispatched) hook events.
             if source == "hook":
                 if not _active_is_live(active):
                     return 0  # no live run -> drop ad-hoc/unrelated activity
@@ -281,17 +294,25 @@ def cmd_hook(args) -> int:
 
     name = _HOOK_EVENT_MAP.get(cursor_event)
     if name:
+        # Real Cursor hook schema (3.8.x): every payload carries conversation_id
+        # / session_id (the agent key) and model. subagentStart/Stop additionally
+        # carry subagent_type, subagent_id, parent_conversation_id, status,
+        # duration_ms. There is no agent_id/root_agent_id. The reliable per-agent
+        # discriminator is the conversation_id/session_id.
         fields = {}
-        st = _first(payload, "subagent_type", "subagentType", "agent_type", "agentType")
-        tool = _first(payload, "tool_name", "toolName", "tool", "tool_type", "toolType")
-        agent_id = _first(payload, "agent_id", "agentId")
-        parent = _first(payload, "parent_agent_id", "parentAgentId", "parent_id", "parentId")
-        root = _first(payload, "root_agent_id", "rootAgentId")
-        session_id = _first(payload, "session_id", "sessionId", "conversation_id", "conversationId")
-        subagent_id = _first(payload, "subagent_id", "subagentId")
-        for k, v in (("subagent_type", st), ("tool", tool), ("agent_id", agent_id),
-                     ("parent_agent_id", parent), ("root_agent_id", root),
-                     ("session_id", session_id), ("subagent_id", subagent_id)):
+        session_id = _first(payload, "session_id", "conversation_id")
+        model = _first(payload, "model", "subagent_model")
+        candidates = {
+            "session_id": session_id,
+            "model": model,
+            "tool": _first(payload, "tool_name", "tool"),
+            "subagent_type": payload.get("subagent_type"),
+            "subagent_id": payload.get("subagent_id"),
+            "parent_session_id": payload.get("parent_conversation_id"),
+            "status": payload.get("status"),
+            "duration_ms": payload.get("duration_ms"),
+        }
+        for k, v in candidates.items():
             if v not in (None, ""):
                 fields[k] = v
         _record_event("hook", name, "", fields)
@@ -439,8 +460,9 @@ def _render(run: dict) -> str:
     if counts:
         out.append("counts : " + ", ".join(f"{k}={v}" for k, v in counts.items()))
 
-    # per-plan durations + tool tally from structured events
+    # per-plan durations + tool tally + per-session (agent) breakdown
     starts, durations, tools = {}, [], {}
+    sessions, order, spawned = {}, [], []
     for ev in events:
         name = (ev.get("event") or "").replace("-", "_")
         if name == "plan_start" and ev.get("plan"):
@@ -449,12 +471,46 @@ def _render(run: dict) -> str:
             durations.append((ev["plan"], starts[ev["plan"]], ev.get("ts"), ev.get("sha")))
         elif name == "tool_use" and ev.get("tool"):
             tools[ev["tool"]] = tools.get(ev["tool"], 0) + 1
+        if name == "subagent_start":
+            spawned.append((ev.get("subagent_type") or "?", ev.get("ts")))
+        sid = ev.get("session_id")
+        if sid:
+            s = sessions.get(sid)
+            if s is None:
+                s = {"model": None, "events": 0, "tool_calls": 0, "failures": 0,
+                     "first": ev.get("ts"), "last": ev.get("ts")}
+                sessions[sid] = s
+                order.append(sid)
+            s["events"] += 1
+            s["last"] = ev.get("ts")
+            if ev.get("model") and not s["model"]:
+                s["model"] = ev["model"]
+            if name == "tool_use":
+                s["tool_calls"] += 1
+            elif name == "tool_fail":
+                s["failures"] += 1
     if durations:
         out.append("plans  :")
         for plan, t0, t1, sha in durations:
             out.append(f"  - {plan}  {_dur(t0, t1)}  sha={sha or '-'}")
     if tools:
         out.append("tools  : " + ", ".join(f"{k}={v}" for k, v in sorted(tools.items())))
+    if sessions:
+        # earliest-seen session is the executor (root); the rest are subagents.
+        order.sort(key=lambda s: sessions[s]["first"] or "")
+        out.append("")
+        out.append(f"agents (sessions): {len(order)}")
+        for i, sid in enumerate(order):
+            s = sessions[sid]
+            role = "executor" if i == 0 else f"subagent {i}"
+            out.append(
+                f"  - [{role}] {sid[:8]}  model={s['model'] or '-'}  "
+                f"tools={s['tool_calls']} fails={s['failures']} events={s['events']}  "
+                f"{s['first']} -> {s['last']}"
+            )
+    if spawned:
+        out.append("subagents spawned (from subagentStart): "
+                   + ", ".join(f"{t}@{ts}" for t, ts in spawned))
 
     tl = run.get("timeline") or [V_line(ev) for ev in events]
     out.append("")

@@ -10,6 +10,8 @@
 
 CURSOR_EVENT="${1:-}"
 CLIENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../client" && pwd)/run_ledger.py"
+# Set RUN_LEDGER_HOOK_DEBUG=1 in the environment to dump raw payloads to
+# var/hook-raw.jsonl when you need to re-inspect the hook schema.
 
 python3 "$CLIENT" hook --cursor-event "$CURSOR_EVENT" 2>/dev/null || echo '{}'
 exit 0

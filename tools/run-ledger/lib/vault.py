@@ -80,6 +80,8 @@ def new_frontmatter(host: str, run_id: str) -> dict:
             "compactions": 0,
             "plans_done": 0,
         },
+        "sessions": {},        # session_id -> {role, model, events, tool_calls, failures, first_seen, last_seen}
+        "subagent_starts": [],  # raw subagentStart hook records (type/timing); often empty
         "tags": [RUN_TAG],
     }
 
@@ -154,6 +156,43 @@ def refresh_frontmatter(fm: dict, ev: dict) -> None:
     }.get(name)
     if bump:
         counts[bump] = counts.get(bump, 0) + 1
+
+    # Per-session (per-agent) breakdown: conversation_id/session_id is the only
+    # reliable per-agent key (subagentStart fires in the parent's session and its
+    # subagent_id never matches the child's session id, so sessions are the unit).
+    sid = ev.get("session_id")
+    if sid:
+        sessions = fm.setdefault("sessions", {})
+        s = sessions.get(sid)
+        if s is None:
+            s = {"model": None, "events": 0, "tool_calls": 0, "failures": 0,
+                 "first_seen": ts, "last_seen": ts}
+            sessions[sid] = s
+        s["events"] += 1
+        s["last_seen"] = ts
+        if ev.get("model") and not s["model"]:
+            s["model"] = ev["model"]
+        if name == "tool_use":
+            s["tool_calls"] += 1
+        elif name == "tool_fail":
+            s["failures"] += 1
+        # Truthful subagent count derived from distinct sessions (earliest =
+        # executor, the rest are subagents). Robust even when subagentStart never
+        # fires, which is the common case for loop-dispatched subagents.
+        counts["subagents"] = max(0, len(sessions) - 1)
+        # Label roles by first-seen order: earliest session is the executor.
+        for i, (k, v) in enumerate(
+            sorted(sessions.items(), key=lambda kv: kv[1].get("first_seen") or "")
+        ):
+            v["role"] = "executor" if i == 0 else f"subagent-{i}"
+
+    if name == "subagent_start":
+        fm.setdefault("subagent_starts", []).append({
+            "subagent_type": ev.get("subagent_type"),
+            "subagent_id": ev.get("subagent_id"),
+            "parent_session_id": ev.get("parent_session_id"),
+            "at": ts,
+        })
 
     if name == "run_complete":
         fm["status"] = "complete"
@@ -243,6 +282,30 @@ class Vault:
         _atomic_write(note_path, render_note(fm, body))
         _append_line(self._events_path(host, run_id), json.dumps(ev, ensure_ascii=False))
         _append_line(self._seen_path(host, run_id), uuid)
+        return True
+
+    def rebuild(self, host: str, run_id: str) -> bool:
+        """Regenerate a run note from its raw events sidecar.
+
+        Used to retro-apply note-format/frontmatter changes to existing runs.
+        The sidecar (.events.jsonl) is the source of truth; the note is derived.
+        """
+        epath = self._events_path(host, run_id)
+        if not os.path.exists(epath):
+            return False
+        fm, body = new_frontmatter(host, run_id), new_body()
+        with open(epath, encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ev = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                body = append_timeline(body, timeline_line(ev))
+                refresh_frontmatter(fm, ev)
+        _atomic_write(self._note_path(host, run_id), render_note(fm, body))
         return True
 
     # query ---------------------------------------------------------------- #
