@@ -14,19 +14,23 @@ agents past genuine blockers, and pushes the branch at the end. It does **not**
 write plan code itself — the per-plan agents do.
 
 Each per-plan agent is launched via deterministic scripts (JSON in/out) into a
-tmux window running `cursor-agent`. Launching it as a **top-level** process —
+tmux pane running `cursor-agent`. Launching it as a **top-level** process —
 rather than a Task subagent — is deliberate: a Task subagent cannot spawn its
 own subagents, so a per-plan Task subagent is forced to implement+review inline.
 A top-level `cursor-agent` is free to dispatch implementation-loop's own
 implementer/reviewer subagents, giving a real depth-3 tree
 (executor → per-plan agent → implementer/reviewer) that the run-ledger captures.
 
-While a per-plan agent runs the executor **waits idle** on a completion sentinel
-(via `AwaitShell`) — it does **not** read the agent's output/transcript while it
-runs (that would burn its context for no benefit) — doing nothing until the
-sentinel fires or the user intervenes. On a user intervention it relays an
-explicitly-marked directive into the agent's chat via
-`cursor-agent --resume <chat_id>` (see [Directive injection](#directive-injection)).
+**The executor does not block while a per-plan agent runs.** It launches the
+agent and a background completion watcher, then **ends its turn** so it stays
+free for user (or other-agent) input. It is re-woken by the watcher's background
+completion notification the moment the agent finishes (not after any timeout) —
+it does **not** read the agent's output/transcript while it runs (that would
+burn its context for no benefit). At any time the executor (being free) can act
+on user input: relay an explicitly-marked directive into the agent's chat via
+`cursor-agent --resume <chat_id>`, or interrupt the run outright
+(see [Directive injection](#directive-injection)). Run state lives in
+`~/.exec-runs/<run_id>/`, so the loop resumes cleanly across turn boundaries.
 
 ## Inputs
 - **Plans** — one or more plan files . At least one is required. Order matters: later plans
@@ -49,7 +53,7 @@ explicitly-marked directive into the agent's chat via
 ## Companion scripts and references (in this skill dir)
 - `scripts/exec_session.py` — resolve/create the run's tmux session (JSON out).
 - `scripts/exec_dispatch.py` — launch ONE per-plan `cursor-agent` in a tmux window (JSON in/out). Run, do not read.
-- `scripts/watch.sh` — completion-sentinel watcher (`__EXEC_DONE__ rc=`), consumed via `AwaitShell`. Run, do not read.
+- `scripts/watch.sh` — completion-sentinel watcher (`__EXEC_DONE__ rc=`), run as a **background** shell (`block_until_ms: 0`); its completion notification re-wakes the executor. Run, do not read.
 - `scripts/exec_collect.py` — parse `pane.log` (stream-json) + git evidence into `verdict.json` (JSON in/out).
 - `references/run-state.md` — the `~/.exec-runs/<run_id>/` tree and every script's JSON contract.
 - `references/dispatch-prompt.md` — the per-plan agent prompt.
@@ -71,14 +75,16 @@ explicitly-marked directive into the agent's chat via
 - **One top-level `cursor-agent` per plan; one plan at a time.** Each per-plan
   agent runs the `.ai/skills/common/implementation-loop/SKILL.md` skill and is
   launched via `scripts/exec_dispatch.py` (a top-level `cursor-agent -p` process
-  in its own tmux window), **not** the Task tool — that is what lets it dispatch
-  its own implementer/reviewer subagents. Capture the returned `pane`/`chat_id`
-  for steering. The executor then **waits idle** on the completion sentinel via
-  `AwaitShell`, without reading the agent's output/transcript — see
-  [Directive injection](#directive-injection). Strictly one plan at a time: do
-  not start the next plan until the current one has finished and its commit is
-  confirmed by git evidence. Parallel only on explicit user opt-in (separate
-  windows make it trivial, but the sequential default stands).
+  in its own tmux pane), **not** the Task tool — that is what lets it dispatch
+  its own implementer/reviewer subagents. Capture the returned `pane`. The
+  executor then starts the background completion watcher and **ends its turn** —
+  it does **not** block (no `AwaitShell` wait) and does not read the agent's
+  output/transcript; it is re-woken by the watcher's completion notification and
+  stays free for input meanwhile — see [Directive injection](#directive-injection).
+  Strictly one plan at a time: do not start the next plan until the current one
+  has finished and its commit is confirmed by git evidence. Parallel only on
+  explicit user opt-in (separate panes make it trivial, but the sequential
+  default stands).
 - **Never re-scope a plan.** One plan file = exactly one per-plan agent,
   regardless of how many files, tests, or sections (including a phase-2
   refactor) it spans. The executor does not reclassify a plan as an "epic",
@@ -198,16 +204,22 @@ is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
 4. **Dispatch one top-level `cursor-agent`.** Pipe JSON to
    `scripts/exec_dispatch.py`: `{run_id, slug, plan_path, branch, repo_root,
    model, prompt_path, parent}` (`parent` = the executor's own conversation id
-   when resolvable, for telemetry lineage). It opens a tmux window and launches
-   `cursor-agent`. Keep the returned `{pane, log_path, result_path}`. Do **not**
-   use the Task tool here.
-5. **Wait idle on the sentinel.** Start `scripts/watch.sh <log_path>` via the
-   Shell tool with `block_until_ms=0` (capture its shell id), then
-   `AwaitShell` on the regex `__EXEC_DONE__ rc=` (size the cap to the plan; e.g.
-   `block_until_ms` of a few hours). Do **not** read the agent's
-   output/transcript while it runs. Do not start the next plan until this one has
-   finished (see [Directive injection](#directive-injection) for user steering).
-6. **Collect + confirm by evidence, not self-report.** Pipe
+   when resolvable, for telemetry lineage). It splits a tmux pane and launches
+   `cursor-agent`. Keep the returned `{pane, log_path}`. Do **not** use the Task
+   tool here.
+5. **Start the completion watcher in the background, then free the turn.** Run
+   `scripts/watch.sh <log_path>` via the Shell tool with `block_until_ms: 0`
+   (background — capture its shell id) so it does **not** block the turn. Then
+   **end the turn**: the executor stays free for user/other-agent input while the
+   per-plan agent runs in its pane. The background watcher completes the instant
+   the `__EXEC_DONE__ rc=` sentinel appears (≈1s after the agent finishes, not at
+   any cap), and its **completion notification re-wakes the executor** to run
+   step 6. Do **not** `AwaitShell`-block on it, and do **not** read the agent's
+   pane/transcript while it runs. (If the user sends a directive meanwhile, see
+   [Directive injection](#directive-injection); resume waiting after.) Do not
+   start the next plan until this one has finished.
+6. **On the watcher's completion — collect + confirm by evidence, not
+   self-report.** Pipe
    `{run_id, slug, baseline_sha, repo_root}` to `scripts/exec_collect.py`. It
    writes `verdict.json` and returns `{status, rc, committed, head_sha, chat_id, ...}`.
    The plan is done **only** when `committed` is true (HEAD advanced past the
@@ -300,10 +312,12 @@ finishes (and, mid-run, from `pane.log` — the stream-json `system/init` line e
     after the agent finishes its turn via `cursor-agent --resume <chat_id> -p
     "<directive>"`. If the plan already committed (evidence gate passed) before
     you deliver it, the hint is moot — drop it.
-- **Trigger (user only, during the run):** the executor does **not** watch the
-  agent while it runs — it waits idle on the sentinel. Mid-run injection happens
-  only when the **user** types a message to the main loop while an agent is
-  running.
+- **Trigger (user only, during the run):** the executor's turn has **ended**
+  while the agent runs (it is free), so it does not watch the agent. Mid-run
+  injection happens when the **user** (or another agent) sends a message to the
+  main loop while a per-plan agent is still running; that input re-engages the
+  free executor, which then injects/interrupts and goes back to waiting for the
+  completion notification.
 - **User routing (explicit marker only):** relay a user message to the agent
   **only** when explicitly addressed to it — it starts with `subagent:` /
   `agent:` or "tell the agent ...". Any other user message is guidance to the
@@ -391,11 +405,13 @@ execution_loop_report:
     commands, no content-describing parentheticals) + related-plan status;
     nothing already in the plan or docs was restated; no step-by-step
     micromanagement.
-[ ] The executor waited idle on the sentinel (`watch.sh` + `AwaitShell`) and
-    confirmed by `exec_collect.py` evidence (`verdict.json.committed`: clean tree
-    + HEAD advanced past the recorded baseline) before dispatching the next —
-    never by trusting the agent's self-report, never by reading its transcript
-    mid-run.
+[ ] The executor did **not** block while a per-plan agent ran: it started
+    `watch.sh` as a background shell (`block_until_ms: 0`) and ended its turn
+    (free for user/other-agent input), then resumed on the watcher's completion
+    notification. It confirmed by `exec_collect.py` evidence
+    (`verdict.json.committed`: clean tree + HEAD advanced past the recorded
+    baseline) before dispatching the next — never by trusting the agent's
+    self-report, never by reading its transcript mid-run.
 [ ] Execution order matched the user-supplied order; no implicit reordering (a
     different order or a parallel run happened only on explicit user request).
 [ ] `.agents/skills/cli-escalation-notify/SKILL.md` fired on plan start, plan finish, and every
