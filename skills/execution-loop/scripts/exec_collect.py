@@ -9,6 +9,11 @@ never the agent's self-report.
 Reads JSON on stdin: {run_id, slug, baseline_sha, repo_root}
 Writes ~/.exec-runs/<run_id>/plans/<slug>/verdict.json and emits it on stdout:
   {status, rc, baseline_sha, head_sha, clean_tree, committed, chat_id, collected_at}
+
+Telemetry (deterministic, fail-open): after the verdict is written, invokes
+`run_ledger.py ingest-pane` to turn this plan's finished pane.log + verdict.json
+into the per-plan agent's run-ledger node (model, timing, tools, depth-3
+subagents). Plan/run milestones flow through cli-escalation-notify, not here.
 """
 from __future__ import annotations
 
@@ -31,6 +36,29 @@ def _now() -> str:
 def _git(repo: str, *args: str) -> str:
     r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _ledger() -> str:
+    """Path to the run-ledger client (relative to this skill, then HOME)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.normpath(os.path.join(
+        here, "..", "..", "..", "tools", "run-ledger", "client", "run_ledger.py"))
+    if os.path.exists(cand):
+        return cand
+    return os.path.expanduser(
+        "~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py")
+
+
+def _ingest_pane(run_id: str, slug: str, repo: str) -> None:
+    """Emit the per-plan agent node + plan_finish from pane.log. Fail-open."""
+    try:
+        subprocess.run(
+            [sys.executable, _ledger(), "ingest-pane",
+             "--run-id", run_id, "--slug", slug, "--repo", repo],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False)
+    except Exception:
+        pass
 
 
 def _extract_chat_id(path: str):
@@ -95,6 +123,11 @@ def main() -> int:
     }
     with open(os.path.join(plan_dir, "verdict.json"), "w", encoding="utf-8") as f:
         json.dump(verdict, f, indent=2)
+
+    # Telemetry: parse this finished plan's pane.log into the agent's node and a
+    # plan_finish milestone. Deterministic, fail-open — never affects the verdict.
+    _ingest_pane(run_id, slug, repo)
+
     print(json.dumps(verdict))
     return 0
 

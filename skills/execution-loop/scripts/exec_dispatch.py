@@ -2,9 +2,7 @@
 """Launch ONE per-plan agent as a top-level `cursor-agent` in a new tmux pane.
 
 Launching it as a top-level process (not a Task subagent) is what lets it
-dispatch its own subagents at all. The per-plan prompt's first step registers
-the agent with the run-ledger (`run_ledger.py init`), so the launch carries no
-telemetry env — registration is decentralized and observed via the hook.
+dispatch its own subagents at all.
 
 Reads JSON on stdin:
   {run_id, slug, plan_path, branch, repo_root, model?, prompt_path?}
@@ -13,6 +11,11 @@ splits a new pane in the run's tmux session, sends the sentinel-wrapped
 cursor-agent command (stream-json piped to the pane), and emits JSON:
   {pane, plan_dir, log_path, started_at}
 Never blocks: a watcher (watch.sh) detects the completion sentinel.
+
+Telemetry needs nothing here: the per-plan agent's node is emitted later by
+exec_collect.py (via `run_ledger.py ingest-pane`) from the finished pane.log,
+and plan milestones flow through the executor's cli-escalation-notify calls.
+No hooks, no registration.
 """
 from __future__ import annotations
 
@@ -83,8 +86,7 @@ def main() -> int:
     # calls, final result) while remaining parseable — and it carries session_id
     # for `cursor-agent --resume`. stdout flows through `tee` so it is shown in
     # the pane AND saved to pane.log; only stderr is split off to agent.err.
-    # No telemetry env: the prompt's first step runs `run_ledger.py init`, and
-    # the hook registers the agent's session from there.
+    # No telemetry env is needed: the agent's node is parsed from pane.log later.
     cmd = (
         f"cd {shq(repo_root)} && "
         f"( cursor-agent -p --force --trust "

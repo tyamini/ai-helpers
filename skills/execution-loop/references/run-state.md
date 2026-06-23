@@ -43,8 +43,8 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 - stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "started_at": "..."}`
 - side effect: splits a new tmux pane in the run's session and sends the
   sentinel-wrapped `cursor-agent` command (stream-json, piped live to the pane
-  via `tee`). No telemetry env — the prompt's first step runs `run_ledger.py
-  init`, and the hook registers the agent's session. Never blocks.
+  via `tee`). No telemetry env — the agent's node is parsed from `pane.log` at
+  collect time. Never blocks.
 
 ### scripts/watch.sh
 - args: `<abs path to pane.log>`
@@ -70,21 +70,24 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 - `committed` is the authoritative "done" signal: `head_sha != baseline_sha`
   AND `clean_tree`. `status` is `complete` only when `rc == 0` AND `committed`.
 
-## Telemetry: live registry + per-agent vault
-Telemetry scoping is decentralized and lives in the run-ledger, not here:
+## Telemetry: deterministic, hook-free, artifact-derived
+Telemetry lives in the run-ledger and is produced from this run's own artifacts —
+there is **no** Cursor hook, live registry, `init`/`resolve`, or `active.json`:
 
-- **Live registry (machine-local):** `run-ledger/var/live/<session_id>.json` =
-  `{session_id, run_id, role, parent_session_id, registered_at}`. Written by the
-  hook when it observes a `run_ledger.py init` tool call. A hook event is
-  recorded **only** if its session is registered. Keyed by `session_id`, so
-  multiple runs can be live on one machine concurrently. There is **no**
-  `active.json`. The executor registers itself (`init --role executor`) and
-  learns its own id via `resolve`; each per-plan agent self-registers via the
-  `init` first-step in its prompt (`--role subagent --parent <exec_sid>`); the
-  run is deregistered at Stage 4 (`init --end`) with a TTL backstop.
-- **Central vault (tyamini-dev):** one note per agent at
-  `agents/<host>/<session_id>.md` (frontmatter `run_id`/`role`/`parent` wikilink
-  + that agent's timeline). A run = the agent notes sharing a `run_id`.
+- **Run-root note → keyed by `run_id`.** Milestone events (`run_start` at
+  Stage 2; `plan_start`/`plan_finish`/`run_complete` via the executor's
+  cli-escalation-notify calls) carry `run_id` and no `session_id`, so the ledger
+  routes them all to one run-root note. The executor never needs its own
+  session id.
+- **Per-plan agent note → keyed by its `chat_id`.** At collect time,
+  `exec_collect.py` invokes `run_ledger.py ingest-pane --run-id <id> --slug
+  <slug>`, which parses the finished `pane.log` (cursor-agent stream-json) +
+  `verdict.json` into `subagent_start`/`subagent_stop` events: model, machine,
+  real start/end timestamps, a per-tool summary, and any depth-3 Task subagents
+  observed. Frontmatter `parent → [[<host>/<run_id>]]` links it to the run root.
+- **Central vault (tyamini-dev):** one note per node at
+  `agents/<host>/<key>.md` (`<key>` = `session_id`, or `run_id` for the root).
+  A run = the run-root note plus the agent notes sharing its `run_id`.
 
 ## cursor-agent output shape (observed, Cursor 3.8.x)
 Dispatch uses `--output-format stream-json --stream-partial-output`, which emits

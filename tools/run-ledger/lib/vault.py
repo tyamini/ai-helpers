@@ -31,8 +31,11 @@ from typing import Any
 import yaml
 
 # Event fields that are structural (they define the line itself) and so are
-# not repeated as key=value tail on a timeline line.
-STRUCTURAL_KEYS = {"event_uuid", "ts", "host", "run_id", "source", "event"}
+# not repeated as key=value tail on a timeline line. ``tool_counts`` is an
+# aggregate consumed into frontmatter (the human-readable ``tools`` string is
+# what shows on the line), so it is omitted from the tail too.
+STRUCTURAL_KEYS = {"event_uuid", "ts", "host", "run_id", "source", "event",
+                   "tool_counts"}
 
 AGENT_TAG = "orchestration-agent"
 TIMELINE_HEADER = "## Event timeline"
@@ -150,14 +153,33 @@ def refresh_agent_frontmatter(fm: dict, ev: dict, host: str) -> None:
     if bump:
         counts[bump] = counts.get(bump, 0) + 1
 
+    # Per-agent tool summary from ingest-pane: a {tool: count} map. Recorded as a
+    # `tools` frontmatter breakdown plus the tool_calls total.
+    tc = ev.get("tool_counts")
+    if isinstance(tc, dict) and tc:
+        tools = fm.setdefault("tools", {})
+        total = 0
+        for k, v in tc.items():
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            tools[k] = tools.get(k, 0) + n
+            total += n
+        counts["tool_calls"] = counts.get("tool_calls", 0) + total
+
     if name == "run_complete":
         fm["status"] = "complete"
         fm["ended_at"] = ts
     elif name == "blocked":
         fm["status"] = "blocked"
         fm["ended_at"] = ts
+    elif name == "subagent_stop":
+        # a per-plan agent's completion (parsed from its pane.log)
+        fm["ended_at"] = ts
+        if ev.get("status"):
+            fm["status"] = ev["status"]
     elif name == "stop" and not fm.get("ended_at"):
-        # a subagent's own completion (no run_complete for it)
         fm["ended_at"] = ts
 
 

@@ -9,13 +9,11 @@ fields; drop harness lines the plan does not use.
 Because this agent runs as a **top-level `cursor-agent` process** (not a Task
 subagent), it may dispatch its own subagents if its skill does.
 
-The **mandatory first line** registers this agent with the run-ledger (the hook
-observes it and records the session under the run); fill `<run_id>`/`<exec_sid>`.
+Telemetry needs nothing from this prompt: the agent's run-ledger node is parsed
+from its `pane.log` by `exec_collect.py` when the plan finishes (no `init`, no
+hook, no registration step).
 
 ```
-First, run this once so this session is tracked under the run (ignore its output):
-  ~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py init --run-id <run_id> --role subagent --parent <exec_sid>
-
 Run the .ai/skills/common/implementation-loop/SKILL.md skill to execute the
 entire plan at <PLAN_PATH>.
 Use the plan's pass/acceptance criteria as your acceptance criteria (read them
