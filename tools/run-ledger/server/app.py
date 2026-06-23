@@ -2,8 +2,8 @@
 """Central run-ledger ingest+query service (tyamini-dev).
 
 A dependency-free stdlib HTTP service that writes a Markdown/Obsidian vault,
-one note per run. Runs single-threaded so per-note appends are serialised
-(no file-write races).
+one note per agent (linked into a run tree by run_id). Runs single-threaded so
+per-note appends are serialised (no file-write races).
 
 Endpoints
 ---------
@@ -126,6 +126,10 @@ class Handler(BaseHTTPRequestHandler):
                     acked.append(uuid)
             except Exception as exc:
                 errors.append({"event_uuid": uuid, "error": str(exc)})
+                # Ack a malformed-but-identifiable event so a poison pill cannot
+                # retry forever in the client spool.
+                if uuid:
+                    acked.append(uuid)
         return self._send(200, {"acked": acked, "errors": errors})
 
     def do_PUT(self):

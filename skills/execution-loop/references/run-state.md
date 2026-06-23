@@ -39,16 +39,18 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 - side effect: writes `<run_dir>/tmux_session`
 
 ### scripts/exec_dispatch.py
-- stdin JSON: `{run_id, slug, plan_path, branch, repo_root, model?, prompt_path?, parent?}`
-- stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "result_path": ".../pane.log", "started_at": "..."}`
+- stdin JSON: `{run_id, slug, plan_path, branch, repo_root, model?, prompt_path?}`
+- stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "started_at": "..."}`
 - side effect: splits a new tmux pane in the run's session and sends the
   sentinel-wrapped `cursor-agent` command (stream-json, piped live to the pane
-  via `tee`). Never blocks.
+  via `tee`). No telemetry env — the prompt's first step runs `run_ledger.py
+  init`, and the hook registers the agent's session. Never blocks.
 
 ### scripts/watch.sh
 - args: `<abs path to pane.log>`
-- run with `block_until_ms=0`; await via `AwaitShell` on the regex `__EXEC_DONE__ rc=`.
-- exits 0 on the first sentinel line.
+- run as a **background** shell (`block_until_ms: 0`); the executor ends its turn
+  and is re-woken by the background completion notification (no `AwaitShell`
+  block). Exits 0 on the first `__EXEC_DONE__ rc=` sentinel line.
 
 ### scripts/exec_collect.py
 - stdin JSON: `{run_id, slug, baseline_sha, repo_root}`
@@ -67,6 +69,22 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 ```
 - `committed` is the authoritative "done" signal: `head_sha != baseline_sha`
   AND `clean_tree`. `status` is `complete` only when `rc == 0` AND `committed`.
+
+## Telemetry: live registry + per-agent vault
+Telemetry scoping is decentralized and lives in the run-ledger, not here:
+
+- **Live registry (machine-local):** `run-ledger/var/live/<session_id>.json` =
+  `{session_id, run_id, role, parent_session_id, registered_at}`. Written by the
+  hook when it observes a `run_ledger.py init` tool call. A hook event is
+  recorded **only** if its session is registered. Keyed by `session_id`, so
+  multiple runs can be live on one machine concurrently. There is **no**
+  `active.json`. The executor registers itself (`init --role executor`) and
+  learns its own id via `resolve`; each per-plan agent self-registers via the
+  `init` first-step in its prompt (`--role subagent --parent <exec_sid>`); the
+  run is deregistered at Stage 4 (`init --end`) with a TTL backstop.
+- **Central vault (tyamini-dev):** one note per agent at
+  `agents/<host>/<session_id>.md` (frontmatter `run_id`/`role`/`parent` wikilink
+  + that agent's timeline). A run = the agent notes sharing a `run_id`.
 
 ## cursor-agent output shape (observed, Cursor 3.8.x)
 Dispatch uses `--output-format stream-json --stream-partial-output`, which emits

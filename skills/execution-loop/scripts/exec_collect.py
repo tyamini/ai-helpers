@@ -12,12 +12,12 @@ Writes ~/.exec-runs/<run_id>/plans/<slug>/verdict.json and emits it on stdout:
 """
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 
 def run_dir(run_id: str) -> str:
@@ -25,7 +25,7 @@ def run_dir(run_id: str) -> str:
 
 
 def _now() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _git(repo: str, *args: str) -> str:

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Launch ONE per-plan agent as a top-level `cursor-agent` in a new tmux pane.
 
-Because the per-plan agent is a fresh top-level process (not a Task subagent),
-it is free to dispatch its own implementer/reviewer Task subagents -> the run
-gains real depth-3 (executor -> per-plan agent -> implementer/reviewer).
+Launching it as a top-level process (not a Task subagent) is what lets it
+dispatch its own subagents at all. The per-plan prompt's first step registers
+the agent with the run-ledger (`run_ledger.py init`), so the launch carries no
+telemetry env — registration is decentralized and observed via the hook.
 
 Reads JSON on stdin:
-  {run_id, slug, plan_path, branch, repo_root, model?, prompt_path?, parent?}
+  {run_id, slug, plan_path, branch, repo_root, model?, prompt_path?}
 Writes/uses ~/.exec-runs/<run_id>/plans/<slug>/{prompt.txt,agent.err,pane.log},
 splits a new pane in the run's tmux session, sends the sentinel-wrapped
 cursor-agent command (stream-json piped to the pane), and emits JSON:
-  {pane, plan_dir, log_path, result_path, started_at}
+  {pane, plan_dir, log_path, started_at}
 Never blocks: a watcher (watch.sh) detects the completion sentinel.
 """
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import shlex
@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 
 def run_dir(run_id: str) -> str:
@@ -30,7 +31,7 @@ def run_dir(run_id: str) -> str:
 
 
 def _now() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def shq(s) -> str:
@@ -43,7 +44,6 @@ def main() -> int:
     slug = data["slug"]
     repo_root = data["repo_root"]
     model = data.get("model")
-    parent = data.get("parent", "")
 
     rd = run_dir(run_id)
     try:
@@ -77,21 +77,17 @@ def main() -> int:
         return 1
     pane = r.stdout.strip()
 
-    # Env assignments must live INSIDE the subshell: `VAR=val ( ... )` is a
-    # bash syntax error, so we `export` them as the subshell's first statements.
-    exports = f"export RUN_LEDGER_RUN_ID={shq(run_id)}; "
-    if parent:
-        exports += f"export RUN_LEDGER_PARENT={shq(parent)}; "
     model_flag = f"--model {shq(model)} " if model and model != "auto" else ""
 
     # stream-json keeps the run visible LIVE in the pane (assistant deltas, tool
     # calls, final result) while remaining parseable — and it carries session_id
     # for `cursor-agent --resume`. stdout flows through `tee` so it is shown in
     # the pane AND saved to pane.log; only stderr is split off to agent.err.
+    # No telemetry env: the prompt's first step runs `run_ledger.py init`, and
+    # the hook registers the agent's session from there.
     cmd = (
         f"cd {shq(repo_root)} && "
-        f"( {exports}"
-        f"cursor-agent -p --force --trust "
+        f"( cursor-agent -p --force --trust "
         f"--output-format stream-json --stream-partial-output "
         f"{model_flag}--workspace {shq(repo_root)} "
         f'"$(cat {shq(prompt_path)})" 2> {shq(agent_err)} ; '
@@ -105,7 +101,6 @@ def main() -> int:
         "pane": pane,
         "plan_dir": plan_dir,
         "log_path": pane_log,
-        "result_path": pane_log,
         "started_at": _now(),
     }))
     return 0

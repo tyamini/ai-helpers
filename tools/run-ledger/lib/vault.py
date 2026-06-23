@@ -2,19 +2,23 @@
 
 Both the central server and the client import this module so they produce
 identical note formatting. The vault is a plain folder of Markdown notes,
-one per run, that opens directly in Obsidian.
+**one per agent** (executor, per-plan agent, ...), linked into a run tree by a
+shared ``run_id`` and a ``parent`` wikilink. A logical run is the set of agent
+notes sharing a ``run_id`` (browse via the Obsidian graph or a Dataview query
+``WHERE run_id = X``).
 
 Layout::
 
     <vault>/
-      runs/<host>/<run_id>.md              # frontmatter + append-only timeline
+      agents/<host>/<session_id>.md        # one agent note: frontmatter + its timeline
       enrichment/<host>__<run_id>__<type>.md
-      .index/<host>__<run_id>.seen         # applied event_uuids (dedupe)
-      .index/<host>__<run_id>.events.jsonl # raw events (forward-compat)
+      .index/<host>__<key>.seen            # applied event_uuids (dedupe)
+      .index/<host>__<key>.events.jsonl    # raw events (forward-compat)
+      runs/<host>/<run_id>.md              # legacy one-note-per-run (read-only fallback)
 
-The design is schemaless and append-only: unknown event fields are never
-lost (they appear as ``key=value`` on the timeline line and verbatim in the
-``.events.jsonl`` sidecar), so new fields never require a migration.
+``<key>`` is the event's ``session_id`` (or, for an event lacking one, its
+``run_id``). The model is schemaless and append-only: unknown event fields are
+preserved as ``key=value`` on the timeline line and verbatim in the sidecar.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import yaml
 # not repeated as key=value tail on a timeline line.
 STRUCTURAL_KEYS = {"event_uuid", "ts", "host", "run_id", "source", "event"}
 
-RUN_TAG = "orchestration-run"
+AGENT_TAG = "orchestration-agent"
 TIMELINE_HEADER = "## Event timeline"
 
 
@@ -62,27 +66,23 @@ def render_note(fm: dict, body: str) -> str:
     return f"---\n{front}\n---\n\n{body.rstrip(chr(10))}\n"
 
 
-def new_frontmatter(host: str, run_id: str) -> dict:
+def new_agent_frontmatter(host: str, key: str, run_id: str,
+                          session_id: str | None, role: str | None,
+                          parent: str | None) -> dict:
     return {
+        "session_id": session_id,
         "run_id": run_id,
+        "role": role or None,
+        "parent": f"[[{host}/{parent}]]" if parent else None,
         "host": host,
-        "aliases": [f"{host}/{run_id}"],
+        "aliases": [f"{host}/{key}"],
+        "model": None,
         "branch": None,
         "status": "running",
         "started_at": None,
         "ended_at": None,
-        "plans": [],
-        "sources": [],
-        "counts": {
-            "subagents": 0,
-            "tool_calls": 0,
-            "failures": 0,
-            "compactions": 0,
-            "plans_done": 0,
-        },
-        "sessions": {},        # session_id -> {role, model, events, tool_calls, failures, first_seen, last_seen}
-        "subagent_starts": [],  # raw subagentStart hook records (type/timing); often empty
-        "tags": [RUN_TAG],
+        "counts": {"tool_calls": 0, "failures": 0, "compactions": 0, "events": 0},
+        "tags": [AGENT_TAG],
     }
 
 
@@ -120,85 +120,44 @@ def append_timeline(body: str, line: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Frontmatter refresh
+# Per-agent frontmatter refresh
 # --------------------------------------------------------------------------- #
-def refresh_frontmatter(fm: dict, ev: dict) -> None:
+def refresh_agent_frontmatter(fm: dict, ev: dict, host: str) -> None:
     name = canonical_event(ev.get("event", ""))
     ts = ev.get("ts")
-    src = ev.get("source")
 
-    fm.setdefault("sources", [])
-    if src and src not in fm["sources"]:
-        fm["sources"].append(src)
-
-    branch = ev.get("branch")
-    if branch:
-        fm["branch"] = branch
-
-    fm.setdefault("plans", [])
-    plan = ev.get("plan")
-    if plan and plan not in fm["plans"]:
-        fm["plans"].append(plan)
+    counts = fm.setdefault("counts", {"tool_calls": 0, "failures": 0,
+                                      "compactions": 0, "events": 0})
+    counts["events"] = counts.get("events", 0) + 1
 
     if not fm.get("started_at"):
         fm["started_at"] = ts
 
-    counts = fm.setdefault(
-        "counts",
-        {"subagents": 0, "tool_calls": 0, "failures": 0, "compactions": 0, "plans_done": 0},
-    )
+    if ev.get("model") and not fm.get("model"):
+        fm["model"] = ev["model"]
+    if ev.get("role"):
+        fm["role"] = ev["role"]
+    if ev.get("branch"):
+        fm["branch"] = ev["branch"]
+    if ev.get("parent_session_id") and not fm.get("parent"):
+        fm["parent"] = f"[[{host}/{ev['parent_session_id']}]]"
+
     bump = {
-        "subagent_start": "subagents",
         "tool_use": "tool_calls",
         "tool_fail": "failures",
         "compaction": "compactions",
-        "plan_finish": "plans_done",
     }.get(name)
     if bump:
         counts[bump] = counts.get(bump, 0) + 1
-
-    # Per-session (per-agent) breakdown: conversation_id/session_id is the only
-    # reliable per-agent key (subagentStart fires in the parent's session and its
-    # subagent_id never matches the child's session id, so sessions are the unit).
-    sid = ev.get("session_id")
-    if sid:
-        sessions = fm.setdefault("sessions", {})
-        s = sessions.get(sid)
-        if s is None:
-            s = {"model": None, "events": 0, "tool_calls": 0, "failures": 0,
-                 "first_seen": ts, "last_seen": ts}
-            sessions[sid] = s
-        s["events"] += 1
-        s["last_seen"] = ts
-        if ev.get("model") and not s["model"]:
-            s["model"] = ev["model"]
-        if name == "tool_use":
-            s["tool_calls"] += 1
-        elif name == "tool_fail":
-            s["failures"] += 1
-        # Truthful subagent count derived from distinct sessions (earliest =
-        # executor, the rest are subagents). Robust even when subagentStart never
-        # fires, which is the common case for loop-dispatched subagents.
-        counts["subagents"] = max(0, len(sessions) - 1)
-        # Label roles by first-seen order: earliest session is the executor.
-        for i, (k, v) in enumerate(
-            sorted(sessions.items(), key=lambda kv: kv[1].get("first_seen") or "")
-        ):
-            v["role"] = "executor" if i == 0 else f"subagent-{i}"
-
-    if name == "subagent_start":
-        fm.setdefault("subagent_starts", []).append({
-            "subagent_type": ev.get("subagent_type"),
-            "subagent_id": ev.get("subagent_id"),
-            "parent_session_id": ev.get("parent_session_id"),
-            "at": ts,
-        })
 
     if name == "run_complete":
         fm["status"] = "complete"
         fm["ended_at"] = ts
     elif name == "blocked":
         fm["status"] = "blocked"
+        fm["ended_at"] = ts
+    elif name == "stop" and not fm.get("ended_at"):
+        # a subagent's own completion (no run_complete for it)
         fm["ended_at"] = ts
 
 
@@ -223,11 +182,26 @@ def _append_line(path: str, line: str) -> None:
         fh.write(line.rstrip("\n") + "\n")
 
 
+def _read_events(path: str) -> list:
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if ln:
+                try:
+                    out.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    pass
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Vault store (server side)
 # --------------------------------------------------------------------------- #
 class Vault:
-    """Filesystem-backed Markdown vault. Used by the central server.
+    """Filesystem-backed Markdown vault, one note per agent.
 
     All writes assume a single writer process (the server is single-threaded),
     so per-note appends are serialised and never race.
@@ -237,22 +211,25 @@ class Vault:
         self.root = os.path.abspath(os.path.expanduser(root))
 
     # paths ---------------------------------------------------------------- #
-    def _note_path(self, host: str, run_id: str) -> str:
+    def _agent_path(self, host: str, key: str) -> str:
+        return os.path.join(self.root, "agents", host, f"{key}.md")
+
+    def _legacy_run_path(self, host: str, run_id: str) -> str:
         return os.path.join(self.root, "runs", host, f"{run_id}.md")
 
-    def _seen_path(self, host: str, run_id: str) -> str:
-        return os.path.join(self.root, ".index", f"{host}__{run_id}.seen")
+    def _seen_path(self, host: str, key: str) -> str:
+        return os.path.join(self.root, ".index", f"{host}__{key}.seen")
 
-    def _events_path(self, host: str, run_id: str) -> str:
-        return os.path.join(self.root, ".index", f"{host}__{run_id}.events.jsonl")
+    def _events_path(self, host: str, key: str) -> str:
+        return os.path.join(self.root, ".index", f"{host}__{key}.events.jsonl")
 
     def _enrichment_path(self, host: str, run_id: str, etype: str) -> str:
         safe = etype.replace("/", "_")
         return os.path.join(self.root, "enrichment", f"{host}__{run_id}__{safe}.md")
 
     # dedupe --------------------------------------------------------------- #
-    def _seen_set(self, host: str, run_id: str) -> set:
-        path = self._seen_path(host, run_id)
+    def _seen_set(self, host: str, key: str) -> set:
+        path = self._seen_path(host, key)
         if not os.path.exists(path):
             return set()
         with open(path, encoding="utf-8") as fh:
@@ -260,62 +237,72 @@ class Vault:
 
     # ingest --------------------------------------------------------------- #
     def record(self, ev: dict) -> bool:
-        """Apply one event. Returns True if appended, False if a duplicate."""
+        """Apply one event to its agent note. Returns True if appended, False if dup."""
         host = ev.get("host")
         run_id = ev.get("run_id")
-        uuid = ev.get("event_uuid")
-        if not host or not run_id or not uuid:
+        uuid_ = ev.get("event_uuid")
+        if not host or not run_id or not uuid_:
             raise ValueError("event missing host/run_id/event_uuid")
 
-        if uuid in self._seen_set(host, run_id):
+        sid = ev.get("session_id")
+        key = sid or run_id  # events without a session route to a run-keyed note
+
+        if uuid_ in self._seen_set(host, key):
             return False
 
-        note_path = self._note_path(host, run_id)
+        note_path = self._agent_path(host, key)
         if os.path.exists(note_path):
             with open(note_path, encoding="utf-8") as fh:
                 fm, body = parse_note(fh.read())
         else:
-            fm, body = new_frontmatter(host, run_id), new_body()
+            fm = new_agent_frontmatter(host, key, run_id, sid,
+                                       ev.get("role"), ev.get("parent_session_id"))
+            body = new_body()
 
         body = append_timeline(body, timeline_line(ev))
-        refresh_frontmatter(fm, ev)
+        refresh_agent_frontmatter(fm, ev, host)
         _atomic_write(note_path, render_note(fm, body))
-        _append_line(self._events_path(host, run_id), json.dumps(ev, ensure_ascii=False))
-        _append_line(self._seen_path(host, run_id), uuid)
+        _append_line(self._events_path(host, key), json.dumps(ev, ensure_ascii=False))
+        _append_line(self._seen_path(host, key), uuid_)
         return True
 
-    def rebuild(self, host: str, run_id: str) -> bool:
-        """Regenerate a run note from its raw events sidecar.
-
-        Used to retro-apply note-format/frontmatter changes to existing runs.
-        The sidecar (.events.jsonl) is the source of truth; the note is derived.
-        """
-        epath = self._events_path(host, run_id)
-        if not os.path.exists(epath):
+    def rebuild(self, host: str, key: str) -> bool:
+        """Regenerate one agent note from its raw events sidecar."""
+        epath = self._events_path(host, key)
+        events = _read_events(epath)
+        if not events:
             return False
-        fm, body = new_frontmatter(host, run_id), new_body()
-        with open(epath, encoding="utf-8") as fh:
-            for ln in fh:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    ev = json.loads(ln)
-                except json.JSONDecodeError:
-                    continue
-                body = append_timeline(body, timeline_line(ev))
-                refresh_frontmatter(fm, ev)
-        _atomic_write(self._note_path(host, run_id), render_note(fm, body))
+        run_id = events[0].get("run_id", "")
+        sid = events[0].get("session_id")
+        fm = new_agent_frontmatter(host, key, run_id, sid,
+                                   events[0].get("role"),
+                                   events[0].get("parent_session_id"))
+        body = new_body()
+        for ev in events:
+            body = append_timeline(body, timeline_line(ev))
+            refresh_agent_frontmatter(fm, ev, host)
+        _atomic_write(self._agent_path(host, key), render_note(fm, body))
         return True
+
+    def rebuild_run(self, host: str, run_id: str) -> int:
+        """Rebuild every agent note belonging to a run. Returns the count."""
+        n = 0
+        for fm in self._agent_frontmatters(host):
+            if fm.get("run_id") == run_id and fm.get("_key"):
+                if self.rebuild(host, fm["_key"]):
+                    n += 1
+        return n
 
     # query ---------------------------------------------------------------- #
-    def list_runs(self) -> list[dict]:
-        runs_dir = os.path.join(self.root, "runs")
+    def _agent_frontmatters(self, host: str | None = None) -> list[dict]:
+        """All agent-note frontmatters (each annotated with its file `_key`/`host`)."""
         out = []
-        if not os.path.isdir(runs_dir):
+        base = os.path.join(self.root, "agents")
+        if not os.path.isdir(base):
             return out
-        for host in sorted(os.listdir(runs_dir)):
-            hdir = os.path.join(runs_dir, host)
+        hosts = [host] if host else sorted(os.listdir(base))
+        for h in hosts:
+            hdir = os.path.join(base, h)
             if not os.path.isdir(hdir):
                 continue
             for fn in sorted(os.listdir(hdir)):
@@ -323,28 +310,89 @@ class Vault:
                     continue
                 with open(os.path.join(hdir, fn), encoding="utf-8") as fh:
                     fm, _ = parse_note(fh.read())
+                fm["_key"] = fn[:-3]
+                fm["host"] = fm.get("host") or h
                 out.append(fm)
         return out
 
+    def list_runs(self) -> list[dict]:
+        """One summary per run_id, aggregated across its agent notes."""
+        runs: dict = {}
+        for fm in self._agent_frontmatters():
+            rid = fm.get("run_id")
+            if not rid:
+                continue
+            key = (fm.get("host"), rid)
+            r = runs.get(key)
+            if r is None:
+                r = {"run_id": rid, "host": fm.get("host"), "branch": None,
+                     "status": "running", "started_at": None, "ended_at": None,
+                     "agents": 0, "counts": {"tool_calls": 0, "failures": 0,
+                                             "compactions": 0, "events": 0}}
+                runs[key] = r
+            r["agents"] += 1
+            c = fm.get("counts") or {}
+            for k in r["counts"]:
+                r["counts"][k] += c.get(k, 0)
+            st = fm.get("started_at")
+            if st and (r["started_at"] is None or st < r["started_at"]):
+                r["started_at"] = st
+            en = fm.get("ended_at")
+            if en and (r["ended_at"] is None or en > r["ended_at"]):
+                r["ended_at"] = en
+            if fm.get("role") == "executor":
+                r["branch"] = fm.get("branch")
+                r["status"] = fm.get("status") or r["status"]
+
+        out = list(runs.values())
+        # include legacy one-note-per-run summaries (old format)
+        legacy_dir = os.path.join(self.root, "runs")
+        if os.path.isdir(legacy_dir):
+            for h in sorted(os.listdir(legacy_dir)):
+                hdir = os.path.join(legacy_dir, h)
+                if not os.path.isdir(hdir):
+                    continue
+                for fn in sorted(os.listdir(hdir)):
+                    if fn.endswith(".md"):
+                        with open(os.path.join(hdir, fn), encoding="utf-8") as fh:
+                            fm, _ = parse_note(fh.read())
+                        fm["legacy"] = True
+                        out.append(fm)
+        return out
+
     def get_run(self, host: str, run_id: str) -> dict | None:
-        note_path = self._note_path(host, run_id)
-        if not os.path.exists(note_path):
-            return None
-        with open(note_path, encoding="utf-8") as fh:
-            fm, body = parse_note(fh.read())
+        """Return the run's agent notes + merged events, or a legacy single note."""
+        agents, events = [], []
+        for fm in self._agent_frontmatters(host):
+            if fm.get("run_id") != run_id:
+                continue
+            agents.append(fm)
+            events.extend(_read_events(self._events_path(host, fm["_key"])))
 
-        events = []
-        epath = self._events_path(host, run_id)
-        if os.path.exists(epath):
-            with open(epath, encoding="utf-8") as fh:
-                for ln in fh:
-                    ln = ln.strip()
-                    if ln:
-                        try:
-                            events.append(json.loads(ln))
-                        except json.JSONDecodeError:
-                            pass
+        if agents:
+            events.sort(key=lambda e: e.get("ts") or "")
+            return {
+                "host": host,
+                "run_id": run_id,
+                "agents": agents,
+                "events": events,
+                "enrichment": self._enrichment_for(host, run_id),
+            }
 
+        # legacy fallback: old one-note-per-run format
+        legacy = self._legacy_run_path(host, run_id)
+        if os.path.exists(legacy):
+            with open(legacy, encoding="utf-8") as fh:
+                fm, body = parse_note(fh.read())
+            return {
+                "frontmatter": fm,
+                "timeline": [ln for ln in body.splitlines() if ln.startswith("- ")],
+                "events": _read_events(self._events_path(host, run_id)),
+                "enrichment": self._enrichment_for(host, run_id),
+            }
+        return None
+
+    def _enrichment_for(self, host: str, run_id: str) -> list:
         enrichment = []
         edir = os.path.join(self.root, "enrichment")
         prefix = f"{host}__{run_id}__"
@@ -354,24 +402,13 @@ class Vault:
                     with open(os.path.join(edir, fn), encoding="utf-8") as fh:
                         efm, ebody = parse_note(fh.read())
                     enrichment.append({"file": fn, "frontmatter": efm, "body": ebody})
-
-        return {
-            "frontmatter": fm,
-            "timeline": [ln for ln in body.splitlines() if ln.startswith("- ")],
-            "events": events,
-            "enrichment": enrichment,
-        }
+        return enrichment
 
     # enrichment (link-based, additive) ------------------------------------ #
     def put_enrichment(self, host: str, run_id: str, etype: str, content: str,
                        meta: dict | None = None) -> str:
         link = f"[[{host}/{run_id}]]"
-        fm = {
-            "type": etype,
-            "run": link,
-            "host": host,
-            "run_id": run_id,
-        }
+        fm = {"type": etype, "run": link, "host": host, "run_id": run_id}
         if meta:
             fm.update(meta)
         body = f"Enriches {link}\n\n{content.rstrip(chr(10))}\n"

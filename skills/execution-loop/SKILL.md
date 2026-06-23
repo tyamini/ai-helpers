@@ -164,21 +164,26 @@ dependency notes.
 2. **Work branch.** Confirm the parent branch with the user (default: current),
    then create the run's work branch per `.ai/skills/common/git-conventions/SKILL.md`. Verify the
    workspace is clean (`git status --porcelain`); if dirty, stop and ask.
-3. **Anchor the run (telemetry).** Once the work branch exists, generate a run id
-   (`run_id="$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"`) and emit one
-   run-start record so the run-ledger's `active.json` is set before any subagent
-   dispatch — this scopes all hook telemetry to *this* run and anchors its agent
-   tree. Fire-and-forget and non-fatal (swallow output/errors):
+3. **Register the run (telemetry).** Generate a run id
+   (`run_id="$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"`). Let
+   `L=~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py`.
+   Register the executor with the live registry, then learn its own session id
+   (both fire-and-forget and non-fatal — swallow errors):
    ```
-   ~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py \
-     record --source notify --event run-start \
-     --field run_id="$run_id" --field branch=<work-branch> \
-     --field root_agent_id=<this executor's agent id, if resolvable>
+   "$L" init --run-id "$run_id" --role executor
+   exec_sid="$("$L" resolve --run-id "$run_id" --role executor)"
    ```
-   Subsequent `cli-escalation-notify` events inherit this `run_id` from
-   `active.json` automatically. No run-end plumbing is needed: the recorder ends
-   the run window when it processes the `run_complete` (or `blocked`) event that
-   `cli-escalation-notify` emits at Stage 4 / on halt.
+   `init` is observed by the hook, which writes the registry entry keyed by this
+   session; `resolve` reads it back so the executor knows its own `session_id`
+   (used to stamp `notify` events and as `--parent` for dispatched agents). Only
+   registered sessions are recorded, so this is what scopes telemetry to *this*
+   run — and because the registry keys on `session_id`, other runs can be live on
+   the machine at the same time. There is **no** `active.json`. Emit run-start as
+   a notify event stamped with the executor session:
+   ```
+   "$L" record --source notify --event run-start \
+     --run-id "$run_id" --field session_id="$exec_sid" --field branch=<work-branch>
+   ```
 4. **Resolve the tmux session.** Run `scripts/exec_session.py --run-id "$run_id"`.
    It reuses the current session when inside tmux (`$TMUX` set), else creates a
    dedicated `exec-loop-<run_id>` session, and records the name. Keep the
@@ -187,26 +192,30 @@ dependency notes.
    repo_root, session, origin, model, and context.
 
 **Gate:** No open questions; the work branch is checked out on the confirmed
-parent, the tree is clean, the run-start record has been emitted, and the tmux
-session is resolved with `meta.json` written.
+parent, the tree is clean, the executor is registered (`resolve` returned a
+session id), the run-start record was emitted, and the tmux session is resolved
+with `meta.json` written.
 
 ### Stage 3: Execute — one cursor-agent per plan
 For each plan in order (sequential unless the user opted into parallel). `slug`
 is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
 
 1. **Notify start** — dispatch `.agents/skills/cli-escalation-notify/SKILL.md`
-   (`title: execution-loop — starting plan <name>`).
+   (`title: execution-loop — starting plan <name>`), passing `run_id: <run_id>`
+   and `session_id: <exec_sid>` in its `run_context` so the milestone records to
+   the executor's agent note.
 2. **Record the baseline** — capture the branch HEAD with `git rev-parse HEAD`;
    this is the per-plan agent's commit evidence baseline.
 3. **Write the prompt.** Fill `references/dispatch-prompt.md` for this plan
    (goal + only the harness paths this plan needs + related-plan status) and save
-   it to `~/.exec-runs/<run_id>/plans/<slug>/prompt.txt`.
+   it to `~/.exec-runs/<run_id>/plans/<slug>/prompt.txt`. Its **mandatory first
+   step** registers the agent: `run_ledger.py init --run-id <run_id> --role
+   subagent --parent <exec_sid>` — fill `<run_id>`/`<exec_sid>` in.
 4. **Dispatch one top-level `cursor-agent`.** Pipe JSON to
    `scripts/exec_dispatch.py`: `{run_id, slug, plan_path, branch, repo_root,
-   model, prompt_path, parent}` (`parent` = the executor's own conversation id
-   when resolvable, for telemetry lineage). It splits a tmux pane and launches
-   `cursor-agent`. Keep the returned `{pane, log_path}`. Do **not** use the Task
-   tool here.
+   model, prompt_path}`. It splits a tmux pane and launches `cursor-agent`; the
+   agent self-registers via the prompt's `init` first-step (no telemetry env).
+   Keep the returned `{pane, log_path}`. Do **not** use the Task tool here.
 5. **Start the completion watcher in the background, then free the turn.** Run
    `scripts/watch.sh <log_path>` via the Shell tool with `block_until_ms: 0`
    (background — capture its shell id) so it does **not** block the turn. Then
@@ -238,11 +247,15 @@ is dispatched.
 1. After every plan has passed and committed, the executor **pushes** the work
    branch: `git push -u origin <branch>` (never a protected branch — see
    `.ai/skills/common/git-conventions/SKILL.md`).
-2. Dispatch `.agents/skills/cli-escalation-notify/SKILL.md` (`title: execution-loop — run complete`).
-3. Print the run report (see Output format). Do **not** open a PR unless the
+2. Dispatch `.agents/skills/cli-escalation-notify/SKILL.md` (`title: execution-loop — run complete`),
+   again passing `run_id`/`session_id: <exec_sid>` in `run_context`.
+3. **Deregister the run** so no later activity is attributed to it (also the
+   backstop is the registry TTL): `"$L" init --end --run-id "$run_id"`.
+4. Print the run report (see Output format). Do **not** open a PR unless the
    user asked for one.
 
-**Gate:** The branch is pushed and the run report is printed.
+**Gate:** The branch is pushed, the run is deregistered, and the run report is
+printed.
 
 ## Validation subagent
 Dispatch with the Task tool, `subagent_type: explore` (read-only — it must not

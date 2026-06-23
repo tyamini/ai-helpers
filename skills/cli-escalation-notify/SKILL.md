@@ -43,7 +43,7 @@ The skill is **fire-and-forget**:
 
 Before the CLI/IDE gate, append one structured telemetry event so every milestone is captured regardless of Slack delivery (this is the semantic-event source for orchestration-run observability). This step is **fire-and-forget**: it must never change the Slack outcome below, never halt, and swallow all output and errors.
 
-- Resolve `run_id` and `host` from the `run_context` lines if present (e.g. `run_id: 20260531-091158-e2fb11`, `host: tyamini-dev2`).
+- Resolve `run_id`, `session_id`, and `host` from the `run_context` lines if present (e.g. `run_id: 20260531-091158-e2fb11`, `session_id: <executor session>`, `host: tyamini-dev2`).
 - Map `title` → `event` (case-insensitive substring match):
   - `starting plan` → `plan_start`
   - `finished plan` → `plan_finish`
@@ -56,10 +56,11 @@ Before the CLI/IDE gate, append one structured telemetry event so every mileston
   ```
   ~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py \
     record --source notify --event <mapped> \
-    --field run_id=<run_id> --field host=<host> \
+    --field run_id=<run_id> [--field session_id=<session_id>] \
     [--field plan=<plan>] [--field sha=<sha>] [--field branch=<branch>] \
     --field detail=<title>
   ```
+  Pass `session_id` when the caller put it in `run_context` (the executor's own session) so the milestone routes to the executor's agent note. `host` is added by the recorder; do not pass it.
 - The recorder is itself fail-open and owns scope: a missing `run_id` or an unreachable central service simply records nothing — never an error. Do **not** make this step conditional on CLI vs IDE; telemetry is wanted in both. Proceed to step 1 regardless of what this step did.
 
 ### 1. Detect context

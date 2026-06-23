@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
-"""run-ledger client: record / flush / timeline.
+"""run-ledger client: record / hook / flush / timeline / init / resolve.
 
-Runs on every machine. ``record`` is the only command on the hot path and is
-**fail-open**: it never raises and always exits 0, so a telemetry problem can
-never block an orchestration loop.
+Runs on every machine. ``record`` and ``hook`` are the hot path and are
+**fail-open**: they never raise and always exit 0, so a telemetry problem can
+never block an agent.
+
+Scope (the "no unrelated entries" guarantee), decentralized via a live registry
+-------------------------------------------------------------------------------
+Each tracked agent registers itself at skill start by running
+``run_ledger.py init --run-id X --role R [--parent P]``. That command is an
+ordinary shell tool call; the ``postToolUse`` hook that fires for it carries the
+agent's ``session_id`` (which the agent itself does not know), so the recorder
+writes a machine-local registry entry ``var/live/<session_id>.json``.
+
+From then on, a hook event is **kept only if its session is registered**
+(``var/live/<session_id>.json`` exists); its ``run_id``/``role``/``parent`` are
+stamped from the registry. Unregistered sessions (unrelated/ad-hoc work) are
+dropped. Because the key is the globally-unique ``session_id``, any number of
+runs can be live on one machine at once without cross-attribution.
+
+``--source notify`` events are emitted by the executor itself with an explicit
+``--run-id`` (and ``--field session_id=<executor>``), so they are always in
+scope.
 
 Commands
 --------
-- record   build an event, decide scope, append to the local spool, kick a flush
+- init     marker the hook observes to register this session; ``--end`` deregisters a run
+- resolve  print the session_id registered for a given run_id+role (executor self-id)
+- record   build an event, append to the local spool, kick a flush
+- hook      read a Cursor hook payload on stdin, register/scope, record
 - flush    forward spooled events to the central service; drop acked, keep rest
 - timeline render a deterministic per-run summary (central API, vault, or spool)
-
-Scope (the "no unrelated entries" guarantee)
--------------------------------------------
-- ``--source notify`` events always carry a run_id and only fire inside loops.
-- ``--source hook`` events are recorded only while a live run is active:
-  ``active.json`` exists, is not ended, and is younger than RUN_LEDGER_MAX_AGE.
-  If lineage ids are present on both the event and ``active.json`` they must
-  match (excludes a concurrent unrelated session). Otherwise the event is
-  dropped (exit 0).
 
 Config (env)
 ------------
@@ -26,7 +38,8 @@ Config (env)
 - RUN_LEDGER_TOKEN    bearer token (default empty -> no auth header)
 - RUN_LEDGER_VAR      var dir (default <tool>/var)
 - RUN_LEDGER_VAULT    server vault dir, for local timeline reads on tyamini-dev
-- RUN_LEDGER_MAX_AGE  active-run staleness TTL seconds (default 86400)
+- RUN_LEDGER_MAX_AGE  registry-entry staleness TTL seconds (default 86400)
+- RUN_LEDGER_HOOK_DEBUG  when set, dump raw hook payloads to var/hook-raw.jsonl
 """
 
 from __future__ import annotations
@@ -34,9 +47,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -44,6 +59,7 @@ TOOL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, TOOL_DIR)
 
 DEFAULT_URL = "http://tyamini-dev:8723"
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def _var_dir() -> str:
@@ -54,8 +70,12 @@ def _spool_path() -> str:
     return os.path.join(_var_dir(), "spool.jsonl")
 
 
-def _active_path() -> str:
-    return os.path.join(_var_dir(), "active.json")
+def _live_dir() -> str:
+    return os.path.join(_var_dir(), "live")
+
+
+def _live_path(session_id: str) -> str:
+    return os.path.join(_live_dir(), session_id + ".json")
 
 
 def _lock_path() -> str:
@@ -63,7 +83,7 @@ def _lock_path() -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(_TS_FMT)
 
 
 def _host() -> str:
@@ -87,36 +107,88 @@ def _auth_headers() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# active.json (run lifecycle + scoping anchor)
+# Live-session registry (machine-local; the decentralized scope filter)
 # --------------------------------------------------------------------------- #
-def _read_active() -> dict | None:
+def _register(session_id: str, run_id: str, role: str, parent: str) -> None:
+    if not session_id or not run_id:
+        return
+    os.makedirs(_live_dir(), exist_ok=True)
+    data = {
+        "session_id": session_id,
+        "run_id": run_id,
+        "role": role or "",
+        "parent_session_id": parent or "",
+        "registered_at": _now(),
+    }
+    tmp = _live_path(session_id) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, _live_path(session_id))
+
+
+def _lookup(session_id: str) -> dict | None:
+    if not session_id:
+        return None
     try:
-        with open(_active_path(), encoding="utf-8") as fh:
+        with open(_live_path(session_id), encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return None
 
 
-def _write_active(data: dict) -> None:
-    os.makedirs(_var_dir(), exist_ok=True)
-    tmp = _active_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, _active_path())
+def _scan_live(run_id: str, role: str | None = None) -> dict | None:
+    d = _live_dir()
+    if not os.path.isdir(d):
+        return None
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as fh:
+                e = json.load(fh)
+        except Exception:
+            continue
+        if e.get("run_id") == run_id and (role is None or e.get("role") == role):
+            return e
+    return None
 
 
-def _active_is_live(active: dict | None) -> bool:
-    if not active or active.get("ended"):
-        return False
-    started = active.get("started_at")
-    if not started:
-        return False
-    try:
-        t = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return False
-    age = (datetime.now(timezone.utc) - t).total_seconds()
-    return age <= _max_age()
+def _end_run(run_id: str) -> None:
+    d = _live_dir()
+    if not run_id or not os.path.isdir(d):
+        return
+    for fn in os.listdir(d):
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(d, fn)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                e = json.load(fh)
+            if e.get("run_id") == run_id:
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def _prune() -> None:
+    """Drop registry entries older than the TTL (crashed runs that never ended)."""
+    d = _live_dir()
+    if not os.path.isdir(d):
+        return
+    cutoff = _max_age()
+    now = datetime.now(timezone.utc)
+    for fn in os.listdir(d):
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(d, fn)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                e = json.load(fh)
+            t = datetime.strptime(e.get("registered_at", ""), _TS_FMT).replace(tzinfo=timezone.utc)
+            if (now - t).total_seconds() > cutoff:
+                os.remove(p)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -153,54 +225,15 @@ def _parse_fields(pairs: list[str]) -> dict:
 
 
 def _record_event(source: str, name: str, run_id: str, fields: dict) -> int:
-    """Core record logic shared by `record` and `hook`. Always returns 0."""
+    """Build one event and append it to the spool. Always returns 0.
+
+    Scoping already happened upstream (registry lookup in cmd_hook, or an
+    explicit run_id for notify), so this just needs a run_id to attribute to.
+    """
     try:
         name = (name or "").replace("-", "_")
-        source = source or "hook"
-
-        # A process deliberately launched as part of a run (execution-loop's
-        # exec_dispatch.py) carries these in its env. They make this process's
-        # events in-scope by construction and tag their lineage.
-        env_run_id = os.environ.get("RUN_LEDGER_RUN_ID")
-        env_parent = os.environ.get("RUN_LEDGER_PARENT")
-        if env_parent and "parent_session_id" not in fields:
-            fields["parent_session_id"] = env_parent
-
+        source = source or "notify"
         run_id = run_id or fields.get("run_id") or ""
-        active = _read_active()
-        if not run_id:
-            run_id = env_run_id or (active.get("run_id", "") if active else "")
-
-        # run_start anchors the run: write active.json, always record.
-        if name == "run_start":
-            _write_active({
-                "run_id": run_id,
-                "host": _host(),
-                "branch": fields.get("branch"),
-                "started_at": _now(),
-                "root_agent_id": fields.get("root_agent_id"),
-                "ended": False,
-                "ended_at": None,
-            })
-        elif env_run_id:
-            # Dispatched child (per-plan agent or its subagents): in scope by
-            # construction. The launch env is authoritative for the run id, and
-            # active.json window gating does not apply.
-            run_id = env_run_id
-        else:
-            # Scope decision for ordinary (non-dispatched) hook events.
-            if source == "hook":
-                if not _active_is_live(active):
-                    return 0  # no live run -> drop ad-hoc/unrelated activity
-                # Lineage scoping when both sides expose a root id.
-                ev_root = fields.get("root_agent_id")
-                ac_root = active.get("root_agent_id") if active else None
-                if ev_root and ac_root and ev_root != ac_root:
-                    return 0  # concurrent unrelated session
-                if not run_id:
-                    run_id = active.get("run_id", "") if active else ""
-            # notify (and any non-hook) events always carry their own run_id.
-
         if not run_id:
             return 0  # nothing to attribute to
 
@@ -217,16 +250,6 @@ def _record_event(source: str, name: str, run_id: str, fields: dict) -> int:
                 event[k] = v
 
         _spool_append(event)
-
-        # End the run window so later hook activity is dropped.
-        if name in ("run_complete", "blocked") and active:
-            active["ended"] = True
-            active["ended_at"] = _now()
-            try:
-                _write_active(active)
-            except Exception:
-                pass
-
         _spawn_flush()
     except Exception:
         pass  # fail-open: telemetry must never break the caller
@@ -236,9 +259,48 @@ def _record_event(source: str, name: str, run_id: str, fields: dict) -> int:
 def cmd_record(args) -> int:
     fields = _parse_fields(args.field)
     name = args.event or fields.pop("event", "")
-    source = args.source or fields.pop("source", "hook")
+    source = args.source or fields.pop("source", "notify")
     run_id = args.run_id or fields.get("run_id") or ""
     return _record_event(source, name, run_id, fields)
+
+
+# --------------------------------------------------------------------------- #
+# init / resolve (live-session registration)
+# --------------------------------------------------------------------------- #
+def cmd_init(args) -> int:
+    """Marker the hook observes to register this session under a run.
+
+    The actual registration is written by the hook (it alone knows the
+    session_id). `--end` deregisters the whole run now, which is deterministic
+    and needs no session_id.
+    """
+    try:
+        _prune()
+        if args.end:
+            _end_run(args.run_id)
+            print(json.dumps({"ended": args.run_id}))
+        else:
+            print(json.dumps({"init": args.run_id, "role": args.role,
+                              "note": "registration happens via the postToolUse hook"}))
+    except Exception:
+        pass
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    """Print the session_id registered for run_id+role (executor self-identify).
+
+    Retries briefly because the registering hook may fire slightly after the
+    `init` tool call returns.
+    """
+    for _ in range(8):
+        ent = _scan_live(args.run_id, args.role)
+        if ent and ent.get("session_id"):
+            print(ent["session_id"])
+            return 0
+        time.sleep(0.5)
+    sys.stderr.write(f"no registered session for run={args.run_id} role={args.role}\n")
+    return 1
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +319,7 @@ _HOOK_EVENT_MAP = {
 
 
 def _first(payload: dict, *keys):
-    """Return the first present, non-empty value among snake/camel key variants."""
+    """Return the first present, non-empty value among key variants."""
     for k in keys:
         v = payload.get(k)
         if v not in (None, ""):
@@ -265,13 +327,37 @@ def _first(payload: dict, *keys):
     return None
 
 
-def cmd_hook(args) -> int:
-    """Read a hook payload on stdin, extract fields, record. Always exits 0.
+def _parse_init_command(command: str) -> dict | None:
+    """If a shell command is a `run_ledger.py init ...`, parse its args."""
+    if not command:
+        return None
+    try:
+        toks = shlex.split(command)
+    except Exception:
+        return None
+    if "init" not in toks or not any("run_ledger" in t for t in toks):
+        return None
 
-    The exact hook payload schema is not fully documented (KNOWN UNKNOWN: whether
-    a parent/root agent id is present). This reads many key variants defensively
-    and, when RUN_LEDGER_HOOK_DEBUG=1, dumps raw payloads so the schema can be
-    confirmed (the first implementation step in the plan).
+    def val(flag):
+        if flag in toks:
+            i = toks.index(flag)
+            if i + 1 < len(toks):
+                return toks[i + 1]
+        return None
+
+    return {
+        "run_id": val("--run-id"),
+        "role": val("--role"),
+        "parent": val("--parent"),
+        "end": "--end" in toks,
+    }
+
+
+def cmd_hook(args) -> int:
+    """Read a hook payload on stdin, register/scope via the live registry, record.
+
+    Always exits 0. Cursor 3.8.x payloads carry conversation_id/session_id and
+    model; subagentStart/Stop add subagent_type/subagent_id/parent_conversation_id.
     """
     try:
         raw = sys.stdin.read()
@@ -292,33 +378,46 @@ def cmd_hook(args) -> int:
         except Exception:
             pass
 
-    name = _HOOK_EVENT_MAP.get(cursor_event)
-    if name:
-        # Real Cursor hook schema (3.8.x): every payload carries conversation_id
-        # / session_id (the agent key) and model. subagentStart/Stop additionally
-        # carry subagent_type, subagent_id, parent_conversation_id, status,
-        # duration_ms. There is no agent_id/root_agent_id. The reliable per-agent
-        # discriminator is the conversation_id/session_id.
-        fields = {}
-        session_id = _first(payload, "session_id", "conversation_id")
-        model = _first(payload, "model", "subagent_model")
-        candidates = {
-            "session_id": session_id,
-            "model": model,
-            "tool": _first(payload, "tool_name", "tool"),
-            "subagent_type": payload.get("subagent_type"),
-            "subagent_id": payload.get("subagent_id"),
-            "parent_session_id": payload.get("parent_conversation_id"),
-            "status": payload.get("status"),
-            "duration_ms": payload.get("duration_ms"),
-        }
-        for k, v in candidates.items():
-            if v not in (None, ""):
-                fields[k] = v
-        _record_event("hook", name, "", fields)
+    session_id = _first(payload, "session_id", "conversation_id")
 
-    # The stop/sessionEnd events flush the spool even if nothing was recorded.
-    if cursor_event in ("stop", "sessionEnd"):
+    # Registration: observe an `init` tool call and (de)register the session.
+    if cursor_event == "postToolUse":
+        tin = payload.get("tool_input")
+        command = tin.get("command") if isinstance(tin, dict) else None
+        init = _parse_init_command(command) if command else None
+        if init:
+            if init["end"] and init["run_id"]:
+                _end_run(init["run_id"])
+            elif session_id and init["run_id"]:
+                _register(session_id, init["run_id"], init["role"], init["parent"])
+
+    name = _HOOK_EVENT_MAP.get(cursor_event)
+    if name and session_id:
+        ent = _lookup(session_id)
+        if ent:  # registered -> in scope; everything else is dropped
+            fields = {"session_id": session_id}
+            model = _first(payload, "model", "subagent_model")
+            candidates = {
+                "model": model,
+                "tool": _first(payload, "tool_name", "tool"),
+                "subagent_type": payload.get("subagent_type"),
+                "subagent_id": payload.get("subagent_id"),
+                "status": payload.get("status"),
+                "duration_ms": payload.get("duration_ms"),
+            }
+            for k, v in candidates.items():
+                if v not in (None, ""):
+                    fields[k] = v
+            if ent.get("role"):
+                fields["role"] = ent["role"]
+            # Parent: the registry (init --parent) is authoritative; fall back to
+            # the payload's parent_conversation_id when present.
+            parent = ent.get("parent_session_id") or payload.get("parent_conversation_id")
+            if parent:
+                fields["parent_session_id"] = parent
+            _record_event("hook", name, ent["run_id"], fields)
+
+    if cursor_event == "stop":
         _spawn_flush()
 
     # Observe-only hook: emit empty JSON and succeed (never block the agent).
@@ -442,27 +541,29 @@ def _fetch_run(host: str, run_id: str) -> dict | None:
                 if ev.get("host") == host and ev.get("run_id") == run_id:
                     events.append(ev)
     if events:
-        return {"frontmatter": {"run_id": run_id, "host": host, "status": "?(spool)"},
-                "events": events, "timeline": [], "enrichment": []}
+        return {"host": host, "run_id": run_id, "agents": [], "events": events}
     return None
 
 
-def _render(run: dict) -> str:
-    fm = run.get("frontmatter", {})
-    events = run.get("events", [])
-    out = []
-    out.append(f"run_id : {fm.get('run_id')}")
-    out.append(f"host   : {fm.get('host')}")
-    out.append(f"branch : {fm.get('branch')}")
-    out.append(f"status : {fm.get('status')}")
-    out.append(f"window : {fm.get('started_at')} -> {fm.get('ended_at')}")
-    counts = fm.get("counts") or {}
-    if counts:
-        out.append("counts : " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+def _vault_line(ev: dict) -> str:
+    from lib import vault as V
+    return V.timeline_line(ev)
 
-    # per-plan durations + tool tally + per-session (agent) breakdown
+
+def _dur(t0: str | None, t1: str | None) -> str:
+    try:
+        a = datetime.strptime(t0, _TS_FMT)
+        b = datetime.strptime(t1, _TS_FMT)
+        secs = int((b - a).total_seconds())
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+    except Exception:
+        return "?"
+
+
+def _plans_and_tools(events: list) -> tuple:
     starts, durations, tools = {}, [], {}
-    sessions, order, spawned = {}, [], []
     for ev in events:
         name = (ev.get("event") or "").replace("-", "_")
         if name == "plan_start" and ev.get("plan"):
@@ -471,48 +572,55 @@ def _render(run: dict) -> str:
             durations.append((ev["plan"], starts[ev["plan"]], ev.get("ts"), ev.get("sha")))
         elif name == "tool_use" and ev.get("tool"):
             tools[ev["tool"]] = tools.get(ev["tool"], 0) + 1
-        if name == "subagent_start":
-            spawned.append((ev.get("subagent_type") or "?", ev.get("ts")))
-        sid = ev.get("session_id")
-        if sid:
-            s = sessions.get(sid)
-            if s is None:
-                s = {"model": None, "events": 0, "tool_calls": 0, "failures": 0,
-                     "first": ev.get("ts"), "last": ev.get("ts")}
-                sessions[sid] = s
-                order.append(sid)
-            s["events"] += 1
-            s["last"] = ev.get("ts")
-            if ev.get("model") and not s["model"]:
-                s["model"] = ev["model"]
-            if name == "tool_use":
-                s["tool_calls"] += 1
-            elif name == "tool_fail":
-                s["failures"] += 1
+    return durations, tools
+
+
+def _render(run: dict) -> str:
+    events = run.get("events", [])
+    agents = run.get("agents")
+    out = []
+
+    if agents is not None:
+        # Per-agent model: one note per agent, linked by run_id.
+        agents = sorted(agents, key=lambda a: a.get("started_at") or "")
+        starts = [a.get("started_at") for a in agents if a.get("started_at")]
+        ends = [a.get("ended_at") for a in agents if a.get("ended_at")]
+        ex = next((a for a in agents if a.get("role") == "executor"), None)
+        out.append(f"run_id : {run.get('run_id')}")
+        out.append(f"host   : {run.get('host')}")
+        if ex:
+            out.append(f"branch : {ex.get('branch')}")
+            out.append(f"status : {ex.get('status')}")
+        out.append(f"window : {min(starts) if starts else '?'} -> {max(ends) if ends else '?'}")
+        out.append(f"agents : {len(agents)}")
+        for a in agents:
+            c = a.get("counts") or {}
+            out.append(
+                f"  - [{a.get('role') or '?'}] {str(a.get('session_id') or '')[:8]}  "
+                f"model={a.get('model') or '-'}  tools={c.get('tool_calls', 0)} "
+                f"fails={c.get('failures', 0)} events={c.get('events', 0)}  "
+                f"{a.get('started_at')} -> {a.get('ended_at')}"
+            )
+    else:
+        fm = run.get("frontmatter", {})
+        out.append(f"run_id : {fm.get('run_id')}")
+        out.append(f"host   : {fm.get('host')}")
+        out.append(f"branch : {fm.get('branch')}")
+        out.append(f"status : {fm.get('status')}")
+        out.append(f"window : {fm.get('started_at')} -> {fm.get('ended_at')}")
+        counts = fm.get("counts") or {}
+        if counts:
+            out.append("counts : " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+
+    durations, tools = _plans_and_tools(events)
     if durations:
         out.append("plans  :")
         for plan, t0, t1, sha in durations:
             out.append(f"  - {plan}  {_dur(t0, t1)}  sha={sha or '-'}")
     if tools:
         out.append("tools  : " + ", ".join(f"{k}={v}" for k, v in sorted(tools.items())))
-    if sessions:
-        # earliest-seen session is the executor (root); the rest are subagents.
-        order.sort(key=lambda s: sessions[s]["first"] or "")
-        out.append("")
-        out.append(f"agents (sessions): {len(order)}")
-        for i, sid in enumerate(order):
-            s = sessions[sid]
-            role = "executor" if i == 0 else f"subagent {i}"
-            out.append(
-                f"  - [{role}] {sid[:8]}  model={s['model'] or '-'}  "
-                f"tools={s['tool_calls']} fails={s['failures']} events={s['events']}  "
-                f"{s['first']} -> {s['last']}"
-            )
-    if spawned:
-        out.append("subagents spawned (from subagentStart): "
-                   + ", ".join(f"{t}@{ts}" for t, ts in spawned))
 
-    tl = run.get("timeline") or [V_line(ev) for ev in events]
+    tl = run.get("timeline") or [_vault_line(ev) for ev in events]
     out.append("")
     out.append("timeline:")
     out.extend("  " + ln for ln in tl)
@@ -522,23 +630,6 @@ def _render(run: dict) -> str:
         out.append("enrichment:")
         out.extend(f"  - {e.get('file')}" for e in enr)
     return "\n".join(out)
-
-
-def V_line(ev: dict) -> str:
-    from lib import vault as V
-    return V.timeline_line(ev)
-
-
-def _dur(t0: str | None, t1: str | None) -> str:
-    try:
-        a = datetime.strptime(t0, "%Y-%m-%dT%H:%M:%SZ")
-        b = datetime.strptime(t1, "%Y-%m-%dT%H:%M:%SZ")
-        secs = int((b - a).total_seconds())
-        h, rem = divmod(secs, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
-    except Exception:
-        return "?"
 
 
 def cmd_timeline(args) -> int:
@@ -559,6 +650,18 @@ def cmd_timeline(args) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(prog="run_ledger.py")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    i = sub.add_parser("init")
+    i.add_argument("--run-id", dest="run_id", default="")
+    i.add_argument("--role", default="")
+    i.add_argument("--parent", default="")
+    i.add_argument("--end", action="store_true")
+    i.set_defaults(func=cmd_init)
+
+    rs = sub.add_parser("resolve")
+    rs.add_argument("--run-id", dest="run_id", required=True)
+    rs.add_argument("--role", default="executor")
+    rs.set_defaults(func=cmd_resolve)
 
     r = sub.add_parser("record")
     r.add_argument("--source")
