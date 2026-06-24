@@ -75,6 +75,7 @@ export RUN_LEDGER_TOKEN=<token>
 run_ledger.py record --source notify --event plan-finish --run-id R1 --field plan=001-foo
 run_ledger.py ingest-pane --run-id 20260621-104902-ab12cd --slug 001-foo
 run_ledger.py flush
+run_ledger.py rebuild --all                      # central host: regenerate notes from sidecars
 run_ledger.py timeline tyamini-dev2/20260621-104902-ab12cd
 ```
 

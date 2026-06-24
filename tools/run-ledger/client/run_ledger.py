@@ -16,6 +16,7 @@ Commands
 - record       build an event, append to the local spool, kick a flush
 - ingest-pane  parse a finished plan's pane.log + verdict.json into events
 - flush        forward spooled events to the central service; drop acked, keep rest
+- rebuild      regenerate vault notes from their event sidecars (central host)
 - timeline     render a deterministic per-run summary (central API, vault, or spool)
 
 Config (env)
@@ -518,6 +519,36 @@ def _render(run: dict) -> str:
     return "\n".join(out)
 
 
+def cmd_rebuild(args) -> int:
+    """Regenerate vault notes from their raw event sidecars (server-side).
+
+    Use after a vault-format change so existing notes pick up new frontmatter
+    aggregation. Operates directly on RUN_LEDGER_VAULT; run on the central host.
+    """
+    vault_dir = os.environ.get("RUN_LEDGER_VAULT") or os.path.join(_var_dir(), "vault")
+    if not os.path.isdir(vault_dir):
+        sys.stderr.write(f"no vault at {vault_dir}\n")
+        return 1
+    from lib import vault as V
+    vault = V.Vault(vault_dir)
+
+    if args.all:
+        n = 0
+        for fm in vault._agent_frontmatters():
+            key, host = fm.get("_key"), fm.get("host")
+            if key and host and vault.rebuild(host, key):
+                n += 1
+        print(json.dumps({"rebuilt": n}))
+        return 0
+    if args.run:
+        host, run_id = (args.run.split("/", 1) if "/" in args.run else (_host(), args.run))
+        n = vault.rebuild_run(host, run_id)
+        print(json.dumps({"rebuilt": n, "run": f"{host}/{run_id}"}))
+        return 0
+    sys.stderr.write("usage: run_ledger.py rebuild (--all | --run <host/run_id>)\n")
+    return 2
+
+
 def cmd_timeline(args) -> int:
     ref = args.run or ""
     host, run_id = (ref.split("/", 1) if "/" in ref else (_host(), ref))
@@ -552,6 +583,11 @@ def main() -> int:
 
     f = sub.add_parser("flush")
     f.set_defaults(func=cmd_flush)
+
+    rb = sub.add_parser("rebuild")
+    rb.add_argument("--all", action="store_true")
+    rb.add_argument("--run", default="")
+    rb.set_defaults(func=cmd_rebuild)
 
     t = sub.add_parser("timeline")
     t.add_argument("run", nargs="?", default="")
