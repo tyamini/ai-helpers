@@ -63,12 +63,21 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
   "head_sha": "<sha now>",
   "clean_tree": true,
   "committed": true,
+  "exit_reason": "met-criteria | blocked | ... | null",
+  "verification": "pass | fail | not-run | blocked | null",
+  "loop_report_found": true,
+  "green": true,
   "chat_id": "<cursor-agent session_id, for --resume>",
   "collected_at": "2026-06-22T..."
 }
 ```
-- `committed` is the authoritative "done" signal: `head_sha != baseline_sha`
-  AND `clean_tree`. `status` is `complete` only when `rc == 0` AND `committed`.
+- `committed` (git evidence: `head_sha != baseline_sha` AND `clean_tree`) is
+  necessary but **not** sufficient. `exit_reason`/`verification` come from the
+  agent's loop_report (parsed from the terminal `result` event; `null` if the
+  report is missing/unparsed). `green` = `committed` AND
+  `exit_reason == met-criteria` AND `verification == pass` — this is the "done"
+  signal the executor advances on. `status` is `complete` only when `rc == 0`
+  AND `green`; a committed-but-not-green plan is `incomplete` (→ Blocker policy).
 
 ## Telemetry: deterministic, hook-free, artifact-derived
 Telemetry lives in the run-ledger and is produced from this run's own artifacts —

@@ -6,9 +6,15 @@ Combines the completion return code (from pane.log), the cursor-agent output
 into a deterministic verdict. The git evidence is authoritative for "done" -
 never the agent's self-report.
 
+Also pulls the per-plan agent's implementation-loop verdict (exit_reason,
+verification) from the terminal `result` event so the executor can refuse to
+advance on a "committed but red" plan. Git evidence still owns "committed";
+the agent self-report only gates `green`.
+
 Reads JSON on stdin: {run_id, slug, baseline_sha, repo_root}
 Writes ~/.exec-runs/<run_id>/plans/<slug>/verdict.json and emits it on stdout:
-  {status, rc, baseline_sha, head_sha, clean_tree, committed, chat_id, collected_at}
+  {status, rc, baseline_sha, head_sha, clean_tree, committed, exit_reason,
+   verification, loop_report_found, green, chat_id, collected_at}
 
 Telemetry (deterministic, fail-open): after the verdict is written, invokes
 `run_ledger.py ingest-pane` to turn this plan's finished pane.log + verdict.json
@@ -87,6 +93,58 @@ def _extract_chat_id(path: str):
     return None
 
 
+def _extract_loop_report(path: str):
+    """Pull the implementation-loop verdict from the terminal `result` event.
+
+    Returns {exit_reason, verification, found}. Self-report only — used to gate
+    "committed but red"; git evidence still owns "committed". A missing/unparsed
+    report yields found=False, which the caller treats as not-green (fail-safe).
+    """
+    miss = {"exit_reason": None, "verification": None, "found": False}
+    if not os.path.exists(path):
+        return miss
+    # Accumulate all agent prose (assistant text deltas + result events) so a
+    # loop_report emitted mid-stream is caught, not only one in the final event.
+    parts = []
+    try:
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            if o.get("type") == "result" and o.get("result"):
+                parts.append(o["result"])
+            elif o.get("type") == "assistant":
+                content = (o.get("message") or {}).get("content") or []
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+                        parts.append(c["text"])
+    except OSError:
+        return miss
+
+    text = "".join(parts)
+    # Isolate the loop_report block (last occurrence) so we never match prose.
+    idx = text.rfind("loop_report:")
+    if idx == -1:
+        return miss
+    block = text[idx:]
+
+    def _grab(pat):
+        m = re.search(pat, block)
+        return m.group(1) if m else None
+
+    return {
+        "exit_reason": _grab(r"\bexit_reason:\s*([\w-]+)"),
+        "verification": _grab(r"\bresults:\s*([\w-]+)"),
+        "found": True,
+    }
+
+
 def main() -> int:
     d = json.load(sys.stdin)
     run_id = d["run_id"]
@@ -105,11 +163,19 @@ def main() -> int:
                 rc = int(m.group(1))  # keep the last sentinel
 
     chat_id = _extract_chat_id(pane_log)
+    lr = _extract_loop_report(pane_log)
 
     head = _git(repo, "rev-parse", "HEAD")
     clean = _git(repo, "status", "--porcelain") == ""
     committed = bool(head) and head != baseline and clean
-    status = "complete" if (rc == 0 and committed) else "incomplete"
+    # green = committed AND the agent's own loop_report is met-criteria + tests pass.
+    # A missing/unparsed report is not green (fail-safe → executor inspects).
+    green = (
+        committed
+        and lr["exit_reason"] == "met-criteria"
+        and lr["verification"] == "pass"
+    )
+    status = "complete" if (rc == 0 and green) else "incomplete"
 
     verdict = {
         "status": status,
@@ -118,6 +184,10 @@ def main() -> int:
         "head_sha": head,
         "clean_tree": clean,
         "committed": committed,
+        "exit_reason": lr["exit_reason"],
+        "verification": lr["verification"],
+        "loop_report_found": lr["found"],
+        "green": green,
         "chat_id": chat_id,
         "collected_at": _now(),
     }

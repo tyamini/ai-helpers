@@ -54,7 +54,7 @@ on user input: relay an explicitly-marked directive into the agent's chat via
 - `scripts/exec_session.py` — resolve/create the run's tmux session (JSON out).
 - `scripts/exec_dispatch.py` — launch ONE per-plan `cursor-agent` in a tmux window (JSON in/out). Run, do not read.
 - `scripts/watch.sh` — completion-sentinel watcher (`__EXEC_DONE__ rc=`), run as a **background** shell (`block_until_ms: 0`); its completion notification re-wakes the executor. Run, do not read.
-- `scripts/exec_collect.py` — parse `pane.log` (stream-json) + git evidence into `verdict.json` (JSON in/out).
+- `scripts/exec_collect.py` — git evidence + the agent's loop_report verdict (`exit_reason`/`verification`, from the terminal `result` event) into `verdict.json` (JSON in/out). Emits `green` = committed AND met-criteria AND tests pass.
 - `references/run-state.md` — the `~/.exec-runs/<run_id>/` tree and every script's JSON contract.
 - `references/dispatch-prompt.md` — the per-plan agent prompt.
 - The `cursor-agent` CLI must be on `PATH`, and `CURSOR_API_KEY` (or a logged-in session) available to launched processes.
@@ -224,18 +224,21 @@ is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
    `{run_id, slug, baseline_sha, repo_root}` to `scripts/exec_collect.py`. It
    writes `verdict.json`, records the per-plan agent's run-ledger node from
    `pane.log` (deterministic, fail-open), and returns
-   `{status, rc, committed, head_sha, chat_id, ...}`.
-   The plan is done **only** when `committed` is true (HEAD advanced past the
-   baseline AND clean tree). If not committed, the plan is **not** done — resume
-   the same agent via `cursor-agent --resume <chat_id>` (see Blocker policy) to
-   commit/finish; do not advance. Once confirmed, dispatch
+   `{status, rc, committed, green, exit_reason, verification, head_sha, chat_id, ...}`.
+   The plan is done **only** when `green` is true — `committed` (HEAD advanced
+   past the baseline AND clean tree) **and** the agent's loop_report is
+   `exit_reason: met-criteria` with `verification: pass`. A commit alone is not
+   enough: a committed-but-not-green plan (tests failed/not-run/blocked, or no
+   parseable report) is a **reported problem** → [Blocker policy](#blocker-policy);
+   resume the same agent via `cursor-agent --resume <chat_id>` to finish the
+   real work — never advance on the commit alone. Once `green`, dispatch
    `.agents/skills/cli-escalation-notify/SKILL.md`
    (`title: execution-loop — finished plan <name>`).
 7. **On a reported problem** — apply the [Blocker policy](#blocker-policy).
 
-**Gate:** `verdict.json.committed` is true (a real commit landed past the
-recorded baseline, clean tree) for the current plan before the next plan's agent
-is dispatched.
+**Gate:** `verdict.json.green` is true (a real commit landed past the recorded
+baseline with a clean tree, **and** the agent's loop_report is met-criteria with
+tests passing) for the current plan before the next plan's agent is dispatched.
 
 ### Stage 4: Finalize
 1. After every plan has passed and committed, the executor **pushes** the work
@@ -334,10 +337,11 @@ finishes (and, mid-run, from `pane.log` — the stream-json `system/init` line e
   `verdict.json.committed` is true (Stage 3 step 6).
 
 ## Blocker policy
-When a per-plan agent reports a problem (or finishes without committing), the
-executor decides:
+When a per-plan agent reports a problem (or finishes not green — uncommitted, or
+committed with `verification` failed/not-run/blocked, or no parseable
+loop_report), the executor decides:
 - **Not an environment issue** (failing logic, flaky test, unclear step,
-  forgot to commit): normal work. Help the agent — clarify, point at the right
+  forgot to commit, tests not run): normal work. Help the agent — clarify, point at the right
   harness/doc, or resume it via `cursor-agent --resume <chat_id> -p "<directive>"`
   (kill+relaunch only for high-severity course corrections, per
   [Directive injection](#directive-injection)) — and let it keep going until the
@@ -413,9 +417,10 @@ execution_loop_report:
     `watch.sh` as a background shell (`block_until_ms: 0`) and ended its turn
     (free for user/other-agent input), then resumed on the watcher's completion
     notification. It confirmed by `exec_collect.py` evidence
-    (`verdict.json.committed`: clean tree + HEAD advanced past the recorded
-    baseline) before dispatching the next — never by trusting the agent's
-    self-report, never by reading its transcript mid-run.
+    (`verdict.json.green`: clean tree + HEAD advanced past the recorded baseline,
+    AND the agent's loop_report met-criteria with tests passing) before
+    dispatching the next — a commit alone was never enough, and it never read the
+    transcript mid-run.
 [ ] Execution order matched the user-supplied order; no implicit reordering (a
     different order or a parallel run happened only on explicit user request).
 [ ] `.agents/skills/cli-escalation-notify/SKILL.md` fired on plan start, plan finish, and every
