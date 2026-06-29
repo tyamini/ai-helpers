@@ -18,8 +18,10 @@ Subcommands (JSON on stdout):
   watch    Block-poll a PR until CI transitions (PASSED/FAILED/behind) or max-runtime,
            then exit — so a backgrounded run's completion notification wakes the agent
            even after its turn has ended. Liveness is independent of any agent turn.
-  trigger  Post the Jenkins "pipeline please rebuild failed <slug>" PR comment (via gh)
-           for every discovered server.
+  trigger  Post a Jenkins rebuild request PR comment (via gh). Default: rebuild the
+           failed servers ("pipeline please rebuild failed <slug>" per discovered server).
+           With --full: post the single global "pipeline please rebuild" (no slug, no
+           "failed") for a fresh HEAD (new commit, base-merge, PR-prefix change); always posts.
 
 Exit codes:
   0  success (JSON on stdout) — for `watch`, a WATCH_TRANSITION was reached
@@ -378,6 +380,22 @@ def cmd_jmc(args):
 
 def cmd_trigger(args):
     pr = args.pr
+
+    # Full rebuild: a fresh HEAD (new commit, base-merge, or PR-prefix change) needs a
+    # complete rebuild of every pipeline. Post the single global comment with no server
+    # slug and no "failed" qualifier, and never bail out — a brand-new HEAD has no statuses
+    # to discover, so this must always post (no host, no fail).
+    if args.full:
+        comment = "pipeline please rebuild"
+        if args.dry_run:
+            print(json.dumps({"triggered": False, "full": True, "comment": comment}))
+            return 0
+        _out, rc = _gh(["pr", "comment", str(pr), "-R", REPO, "--body", comment], parse=False, check=False)
+        print(json.dumps({
+            "triggered": rc == 0, "full": True, "comment": comment, "reason": "full-rebuild-requested",
+        }))
+        return 0
+
     view = _gh(["pr", "view", str(pr), "-R", REPO, "--json", "mergeStateStatus"])
     if view.get("mergeStateStatus") == "BEHIND":
         print(json.dumps({
@@ -460,6 +478,9 @@ def main():
 
     p_trigger = sub.add_parser("trigger", help="post Jenkins rebuild request (gh pr comment) per server")
     p_trigger.add_argument("--pr", type=int, required=True, help="PR number")
+    p_trigger.add_argument("--full", action="store_true",
+                           help="post a single global 'pipeline please rebuild' (no slug, no 'failed') "
+                                "for a fresh HEAD (new commit, base-merge, PR-prefix change); always posts")
     p_trigger.add_argument("--server", action="append", metavar="SLUG",
                            help="restrict rebuild to this server slug (repeatable); default = all")
     p_trigger.add_argument("--dry-run", action="store_true", help="compose comments but do not post")

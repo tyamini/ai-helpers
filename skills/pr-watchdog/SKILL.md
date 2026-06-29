@@ -74,9 +74,13 @@ tokenless HTTP.
   `10` with `WATCH_MAXRUNTIME <json>`, or `1` with `WATCH_FATAL`. This replaces the old
   in-turn `AwaitShell`-sleep poll loop.
 - `scripts/pr_watchdog.py resolve` — resolve a unique PR from the local branch.
-- `scripts/pr_watchdog.py trigger --pr N [--server SLUG]` — post the Jenkins rebuild request
-  (the `pipeline please rebuild failed <slug>` comment) for every discovered server, or just
-  `--server` ones.
+- `scripts/pr_watchdog.py trigger --pr N [--full] [--server SLUG]` — post the Jenkins rebuild
+  request. **For a fresh HEAD (a new commit, a base-merge, or a PR-prefix/title change) use
+  `--full`**: it posts the single global `pipeline please rebuild` comment — no host/server
+  slug, no `failed` qualifier — and **always posts** (a brand-new HEAD has no statuses to
+  discover, so it never bails with `no-ci-yet`). Without `--full` it rebuilds only the failed
+  servers (`pipeline please rebuild failed <slug>` per discovered server, or just `--server`
+  ones) — use that form only to retry a specific flaky/failed server.
 - `scripts/update_branch.sh --check|--apply <wt> <base> [--push] [--keep-conflict]` — detect /
   fix "branch behind base" **and surface base↔branch merge conflicts**. `--apply` merges
   `origin/<base>` (pushes on `--push`). A clean merge (`ACTION=merged`) is the one
@@ -237,17 +241,16 @@ trigger can fall back to them after a base-merge clears HEAD's statuses). Notify
   and any failure fix locally and pushes once. Do **not** merge-and-push the base here on its
   own — that is the partial-push mistake the batching invariant forbids.
 - **`NO_CI`** or (`FAILED`/idle and not `build_running`) with nothing to fix → run
-  `scripts/pr_watchdog.py trigger --pr <pr>` (subject to the re-trigger guard below). This is
-  the path for **any new commit — whether you pushed it or the watchdog pushed a fix**
-  (branch-update, lint/validate, or an approved code fix). **This CI does NOT auto-build on
-  push** — there is no webhook/branch-scan auto-trigger, so a new HEAD always reports
-  `NO_CI` / `build_running:false` and must be triggered explicitly. `trigger` sources the
-  server slugs from the last commit that had CI when HEAD has none yet (`catalog_source`
-  shows `head` vs `history:<sha>`). If it returns `triggered:false, reason:no-ci-yet` **but**
-  `meta.json.known_server_slugs` is non-empty (a base-merge can push the last CI commit out
-  of the history lookback), retry `trigger --pr <pr> --server <slug>` for each known slug
-  (the `explicit-slugs` fallback). Only a PR that has **never** had CI returns `no-ci-yet`
-  with no cached slugs. Notify "build triggered"; next cycle.
+  `scripts/pr_watchdog.py trigger --pr <pr> --full` (subject to the re-trigger guard below).
+  This is the path for **any fresh HEAD — a new commit, a base-merge, or a PR-prefix/title
+  change — whether you pushed it or the watchdog pushed a fix** (branch-update, lint/validate,
+  or an approved code fix). **This CI does NOT auto-build on push** — there is no
+  webhook/branch-scan auto-trigger, so a new HEAD always reports `NO_CI` /
+  `build_running:false` and must be triggered explicitly. `--full` posts the single global
+  `pipeline please rebuild` (no host/slug, no `failed`) and **always posts** — so there is no
+  server discovery and no `no-ci-yet` to work around. Notify "build triggered"; next cycle.
+  (Only use the per-server `trigger --server <slug>` form to retry one specific flaky/failed
+  server, never for a fresh HEAD.)
 
 **Re-trigger guard (avoid duplicate rebuilds).** Record each trigger in `meta.json`
 (`last_trigger = {sha, at}`). Do **not** re-`trigger` the same HEAD `sha` again until either
@@ -471,10 +474,10 @@ Stage 4 gate has passed):
    `git -C <wt> push origin HEAD:<branch>`. Record the whole batch as one `meta.json.pushes`
    entry (list the `kinds`: e.g. `branch-update` + `prebuild`). Never `git add -A` blindly
    (see `stage-prompts.md` git-add safety).
-2. **Trigger the rebuild — always.** The push does **not** auto-build CI, so immediately run
-   `scripts/pr_watchdog.py trigger --pr <pr>` (with the `explicit-slugs` fallback to
-   `meta.json.known_server_slugs` after a base-merge clears HEAD's statuses). Record
-   `last_trigger`. Notify once (e.g. "fixes pushed & rebuild triggered").
+2. **Trigger the rebuild — always.** The push does **not** auto-build CI, and the new HEAD is
+   a fresh commit/merge, so immediately run `scripts/pr_watchdog.py trigger --pr <pr> --full`:
+   the single global `pipeline please rebuild` (no host/slug, no `failed`) that always posts.
+   Record `last_trigger`. Notify once (e.g. "fixes pushed & rebuild triggered").
 3. **Continue.** Back to Stage 2; the next poll should show `RUNNING` once statuses appear
    (give it ~1–2 min). If it still shows `NO_CI`, the trigger didn't take — retry once per
    the re-trigger guard before waiting the full `interval`.

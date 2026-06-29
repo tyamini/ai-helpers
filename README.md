@@ -20,6 +20,7 @@ Personal AI agent helpers — skills, profiles, and rules used by Cursor / codin
 | `skills/iked-failure-rca/` | Root-cause analysis for IKEd test failures. |
 | `skills/iked-fix-triage/` | Triage and propose fixes for IKEd failures. |
 | `skills/iked-test-loop/` | Iterative test-fix-retest loop for IKEd (runs each test inline in Stage 2c via a tmux pane + sentinel watcher; dispatches `iked-failure-rca` and `iked-fix-triage` on failure). |
+| `skills/management-test-runner/` | Stand up an emulated-SA management env from an image source (cached/latest/PR/Jenkins URL), run management tests in a kept-alive ipython session inside tmux, and triage source edits (yang/cli/routing_manager/quagga) into the minimal rebuild+redeploy (marker-based delta). |
 | `skills/implementor/` | Generic implementation skill. |
 | `skills/ipsec-yang-sync/` | Sync the IPsec YANG/CLI branch from a feature branch. |
 
