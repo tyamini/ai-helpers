@@ -67,7 +67,8 @@ def main() -> int:
 
     agent_err = os.path.join(plan_dir, "agent.err")
     pane_log = os.path.join(plan_dir, "pane.log")
-    open(pane_log, "a").close()  # so the watcher's `tail -F` has a target now
+    pid_path = os.path.join(plan_dir, "agent.pid")
+    open(pane_log, "a").close()  # so the watcher has a target file immediately
 
     # Open a real PANE (split) in the session's active window so the agent is
     # watchable next to the executor — not a separate window/tab.
@@ -79,6 +80,8 @@ def main() -> int:
         print(json.dumps({"error": "split-window-failed", "detail": r.stderr.strip()}))
         return 1
     pane = r.stdout.strip()
+    with open(os.path.join(plan_dir, "pane"), "w", encoding="utf-8") as f:
+        f.write(pane)  # so exec_collect.py can reap the pane after the plan
 
     model_flag = f"--model {shq(model)} " if model and model != "auto" else ""
 
@@ -87,12 +90,17 @@ def main() -> int:
     # for `cursor-agent --resume`. stdout flows through `tee` so it is shown in
     # the pane AND saved to pane.log; only stderr is split off to agent.err.
     # No telemetry env is needed: the agent's node is parsed from pane.log later.
+    #
+    # cursor-agent is backgrounded inside the subshell so its real PID is written
+    # to agent.pid (the watcher uses it for liveness; exec_collect.py reaps it).
+    # `wait` yields the true exit code for the sentinel.
     cmd = (
         f"cd {shq(repo_root)} && "
         f"( cursor-agent -p --force --trust "
         f"--output-format stream-json --stream-partial-output "
         f"{model_flag}--workspace {shq(repo_root)} "
-        f'"$(cat {shq(prompt_path)})" 2> {shq(agent_err)} ; '
+        f'"$(cat {shq(prompt_path)})" 2> {shq(agent_err)} & '
+        f'ap=$! ; echo $ap > {shq(pid_path)} ; wait $ap ; '
         f'echo "__EXEC_DONE__ rc=$?" ) | tee -a {shq(pane_log)}'
     )
 
@@ -103,6 +111,7 @@ def main() -> int:
         "pane": pane,
         "plan_dir": plan_dir,
         "log_path": pane_log,
+        "pid_path": pid_path,
         "started_at": _now(),
     }))
     return 0

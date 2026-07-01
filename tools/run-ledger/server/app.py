@@ -8,6 +8,7 @@ per-note appends are serialised (no file-write races).
 Endpoints
 ---------
 - POST /events                                   ingest one event or a batch
+- POST /runs/{host}/{run_id}/rename              rename agent notes to meaningful names
 - GET  /runs                                     list runs (frontmatter)
 - GET  /runs/{host}/{run_id}                     one run: note + events + enrichment
 - PUT  /runs/{host}/{run_id}/enrichment/{type}   create/replace a linked enrichment note
@@ -100,7 +101,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
-        if self._parts() != ["events"]:
+        parts = self._parts()
+        # runs/{host}/{run_id}/rename
+        if len(parts) == 4 and parts[0] == "runs" and parts[3] == "rename":
+            try:
+                payload = self._read_json() or {}
+                renames = payload.get("renames") or []
+                done = []
+                for r in renames:
+                    if VAULT.rename_agent(parts[1], r.get("old_key", ""),
+                                          r.get("new_name", "")):
+                        done.append(r.get("new_name"))
+                return self._send(200, {"renamed": done})
+            except Exception as exc:
+                return self._send(500, {"error": str(exc)})
+        if parts != ["events"]:
             return self._send(404, {"error": "no route"})
         try:
             payload = self._read_json()
