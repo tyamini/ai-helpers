@@ -437,3 +437,33 @@ class Vault:
         path = self._enrichment_path(host, run_id, etype)
         _atomic_write(path, render_note(fm, body))
         return path
+
+    # rename (additive; make note names meaningful) ------------------------- #
+    def rename_agent(self, host: str, old_key: str, new_name: str) -> bool:
+        """Rename an agent note + its sidecars to a meaningful name.
+
+        Appends the old ``<host>/<old_key>`` to ``aliases`` so existing
+        ``[[host/old_key]]`` wikilinks keep resolving. Idempotent: if the source
+        note is gone (already renamed) or the destination exists, returns False.
+        Never touches other notes.
+        """
+        if not new_name or old_key == new_name:
+            return False
+        src = self._agent_path(host, old_key)
+        dst = self._agent_path(host, new_name)
+        if not os.path.exists(src) or os.path.exists(dst):
+            return False
+        with open(src, encoding="utf-8") as fh:
+            fm, body = parse_note(fh.read())
+        aliases = fm.setdefault("aliases", [])
+        for a in (f"{host}/{old_key}", f"{host}/{new_name}"):
+            if a not in aliases:
+                aliases.append(a)
+        _atomic_write(dst, render_note(fm, body))
+        os.remove(src)
+        for suf in (".seen", ".events.jsonl"):
+            s = os.path.join(self.root, ".index", f"{host}__{old_key}{suf}")
+            d = os.path.join(self.root, ".index", f"{host}__{new_name}{suf}")
+            if os.path.exists(s) and not os.path.exists(d):
+                os.replace(s, d)
+        return True
