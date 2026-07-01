@@ -11,6 +11,8 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
     <NNN>-<slug>/      # NNN = zero-padded plan index; slug = sanitized plan name
       prompt.txt       # the per-plan agent prompt (from references/dispatch-prompt.md)
       agent.err        # cursor-agent stderr
+      agent.pid        # the launched cursor-agent PID (watcher liveness + collect reap)
+      pane             # the tmux pane id (so collect can close it after the plan)
       pane.log         # live tee of the pane: cursor-agent stream-json events + the completion sentinel
       verdict.json     # evidence-based verdict (below)
 ```
@@ -40,17 +42,25 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
 
 ### scripts/exec_dispatch.py
 - stdin JSON: `{run_id, slug, plan_path, branch, repo_root, model?, prompt_path?}`
-- stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "started_at": "..."}`
+- stdout: `{"pane": "%NN", "plan_dir": "...", "log_path": ".../pane.log", "pid_path": ".../agent.pid", "started_at": "..."}`
 - side effect: splits a new tmux pane in the run's session and sends the
   sentinel-wrapped `cursor-agent` command (stream-json, piped live to the pane
-  via `tee`). No telemetry env — the agent's node is parsed from `pane.log` at
-  collect time. Never blocks.
+  via `tee`). cursor-agent is backgrounded inside the subshell so its real PID
+  is written to `agent.pid`; the pane id is written to `pane`. No telemetry env —
+  the agent's node is parsed from `pane.log` at collect time. Never blocks.
 
 ### scripts/watch.sh
-- args: `<abs path to pane.log>`
+- args: `<abs path to pane.log> [pidfile] [idle_secs]` (pass the `pid_path` from
+  dispatch as `pidfile`; `idle_secs` defaults to 1200)
 - run as a **background** shell (`block_until_ms: 0`); the executor ends its turn
   and is re-woken by the background completion notification (no `AwaitShell`
-  block). Exits 0 on the first `__EXEC_DONE__ rc=` sentinel line.
+  block). Exits 0 — printing a `__EXEC_DONE__ rc=<n|reason>` line — on the FIRST
+  of any reliable done signal: the anchored `^__EXEC_DONE__ rc=` sentinel, a
+  terminal stream-json `"type":"result"` event (turn ended even if the process
+  hangs on exit), the agent PID dying without a sentinel (`proc-exit`), or the
+  log going idle for `idle_secs` (`idle-timeout`). The result-event and idle
+  signals are what prevent a hung-but-idle `cursor-agent` from stranding the
+  executor; a slightly-early wake is safe because collect re-checks by evidence.
 
 ### scripts/exec_collect.py
 - stdin JSON: `{run_id, slug, baseline_sha, repo_root}`
@@ -76,8 +86,12 @@ committed). `run_id` is generated at Stage 2 (`YYYYMMDD-HHMMSS-<6hex>`).
   agent's loop_report (parsed from the terminal `result` event; `null` if the
   report is missing/unparsed). `green` = `committed` AND
   `exit_reason == met-criteria` AND `verification == pass` — this is the "done"
-  signal the executor advances on. `status` is `complete` only when `rc == 0`
-  AND `green`; a committed-but-not-green plan is `incomplete` (→ Blocker policy).
+  signal the executor advances on. `status` is `complete` when `green`, else
+  `incomplete` (→ Blocker policy). `rc` is recorded for diagnostics only and is
+  no longer required to be 0, since the watcher may wake the executor on the
+  result event or idle backstop before the process-exit sentinel lands. When
+  `green`, collect reaps the plan's `cursor-agent` (via `agent.pid`) and closes
+  its `pane`, so a finished-but-hung agent cannot leak.
 
 ## Telemetry: deterministic, hook-free, artifact-derived
 Telemetry lives in the run-ledger and is produced from this run's own artifacts —

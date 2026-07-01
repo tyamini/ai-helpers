@@ -67,6 +67,36 @@ def _ingest_pane(run_id: str, slug: str, repo: str) -> None:
         pass
 
 
+def _reap(plan_dir: str) -> None:
+    """Kill a lingering per-plan cursor-agent and close its pane. Fail-open.
+
+    A headless `cursor-agent -p` can finish its turn without the process exiting;
+    left alone it leaks for hours. Resuming a chat does not need the old process
+    alive (--resume rehydrates server-side state), so reaping after collect is
+    always safe.
+    """
+    pid_path = os.path.join(plan_dir, "agent.pid")
+    try:
+        pid = int(open(pid_path, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        pid = None
+    if pid:
+        for sig in ("-TERM", "-KILL"):
+            try:
+                if subprocess.run(["kill", "-0", str(pid)],
+                                  capture_output=True).returncode != 0:
+                    break  # already gone
+                subprocess.run(["kill", sig, str(pid)], capture_output=True)
+            except Exception:
+                break
+    try:
+        pane = open(os.path.join(plan_dir, "pane"), encoding="utf-8").read().strip()
+        if pane:
+            subprocess.run(["tmux", "kill-pane", "-t", pane], capture_output=True)
+    except Exception:
+        pass
+
+
 def _extract_chat_id(path: str):
     """Scan the pane log (stream-json events + sentinel) for a session id.
 
@@ -158,7 +188,9 @@ def main() -> int:
     rc = None
     if os.path.exists(pane_log):
         for line in open(pane_log, errors="replace"):
-            m = re.search(r"__EXEC_DONE__ rc=(\d+)", line)
+            # Anchored: ignore sentinels embedded inside stream-json tool output
+            # (captures of other panes). Only a real, line-start sentinel counts.
+            m = re.match(r"__EXEC_DONE__ rc=(\d+)", line)
             if m:
                 rc = int(m.group(1))  # keep the last sentinel
 
@@ -175,7 +207,12 @@ def main() -> int:
         and lr["exit_reason"] == "met-criteria"
         and lr["verification"] == "pass"
     )
-    status = "complete" if (rc == 0 and green) else "incomplete"
+    # green (evidence: commit + met-criteria loop_report) owns "done". rc is no
+    # longer required to be 0: the watcher may wake the executor on the terminal
+    # result event or an idle backstop before the process-exit sentinel lands, so
+    # gating "complete" on rc==0 would spuriously mark an already-green plan
+    # incomplete.
+    status = "complete" if green else "incomplete"
 
     verdict = {
         "status": status,
@@ -197,6 +234,12 @@ def main() -> int:
     # Telemetry: parse this finished plan's pane.log into the agent's node and a
     # plan_finish milestone. Deterministic, fail-open — never affects the verdict.
     _ingest_pane(run_id, slug, repo)
+
+    # Reap only when the plan is truly done (green): the chat will not be resumed,
+    # so a lingering/hung cursor-agent is pure leak. A not-green plan is left
+    # alone for the executor's Blocker policy (resume/kill decision).
+    if green:
+        _reap(plan_dir)
 
     print(json.dumps(verdict))
     return 0

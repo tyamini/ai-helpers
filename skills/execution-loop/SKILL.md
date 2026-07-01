@@ -53,7 +53,7 @@ on user input: relay an explicitly-marked directive into the agent's chat via
 ## Companion scripts and references (in this skill dir)
 - `scripts/exec_session.py` — resolve/create the run's tmux session (JSON out).
 - `scripts/exec_dispatch.py` — launch ONE per-plan `cursor-agent` in a tmux window (JSON in/out). Run, do not read.
-- `scripts/watch.sh` — completion-sentinel watcher (`__EXEC_DONE__ rc=`), run as a **background** shell (`block_until_ms: 0`); its completion notification re-wakes the executor. Run, do not read.
+- `scripts/watch.sh` — completion watcher, run as a **background** shell (`block_until_ms: 0`); its completion notification re-wakes the executor. Wakes on the FIRST of: the anchored sentinel, a terminal `"type":"result"` event, the agent PID dying, or the log going idle — so a hung-but-idle `cursor-agent` can't strand the executor. Pass it `log_path` and the dispatch `pid_path`. Run, do not read.
 - `scripts/exec_collect.py` — git evidence + the agent's loop_report verdict (`exit_reason`/`verification`, from the terminal `result` event) into `verdict.json` (JSON in/out). Emits `green` = committed AND met-criteria AND tests pass.
 - `references/run-state.md` — the `~/.exec-runs/<run_id>/` tree and every script's JSON contract.
 - `references/dispatch-prompt.md` — the per-plan agent prompt.
@@ -207,10 +207,11 @@ is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
 4. **Dispatch one top-level `cursor-agent`.** Pipe JSON to
    `scripts/exec_dispatch.py`: `{run_id, slug, plan_path, branch, repo_root,
    model, prompt_path}`. It splits a tmux pane and launches `cursor-agent`.
-   Keep the returned `{pane, log_path}`. Do **not** use the Task tool here.
+   Keep the returned `{pane, log_path, pid_path}`. Do **not** use the Task tool here.
 5. **Start the completion watcher in the background, then free the turn.** Run
-   `scripts/watch.sh <log_path>` via the Shell tool with `block_until_ms: 0`
-   (background — capture its shell id) so it does **not** block the turn. Then
+   `scripts/watch.sh <log_path> <pid_path>` via the Shell tool with
+   `block_until_ms: 0` (background — capture its shell id) so it does **not**
+   block the turn. Then
    **end the turn**: the executor stays free for user/other-agent input while the
    per-plan agent runs in its pane. The background watcher completes the instant
    the `__EXEC_DONE__ rc=` sentinel appears (≈1s after the agent finishes, not at
@@ -306,6 +307,18 @@ While a per-plan agent runs, the executor can steer it by resuming its chat via
 its context preserved, **never a fresh launch** for steering. The `chat_id` is
 the cursor-agent `session_id`, available from `verdict.json` after the agent
 finishes (and, mid-run, from `pane.log` — the stream-json `system/init` line emits it first).
+
+**Every resume must be watchable exactly like a dispatch, or the loop can
+stall.** When you resume, wrap it the same way `exec_dispatch.py` does — append
+its stream to the plan's **`pane.log`** (not a side log), background the
+`cursor-agent` and rewrite `agent.pid` with its PID, and emit the trailing
+`__EXEC_DONE__ rc=$?` sentinel — then start a **fresh** `scripts/watch.sh
+<log_path> <pid_path>` background shell before ending the turn. A resume that
+writes to a separate log the watcher isn't reading, or that has no
+result-event / PID / idle signal, is how a finished-but-hung `cursor-agent`
+stranded the executor with no running agent. Collect still reads `pane.log`
+only, so keeping the resume stream there is also what lets it see the real
+loop_report.
 
 - **Behavior change vs Task subagents — no mid-run preemption.** A headless
   `cursor-agent -p` runs its turn to completion; you cannot interrupt it mid-turn
@@ -414,9 +427,9 @@ execution_loop_report:
     nothing already in the plan or docs was restated; no step-by-step
     micromanagement.
 [ ] The executor did **not** block while a per-plan agent ran: it started
-    `watch.sh` as a background shell (`block_until_ms: 0`) and ended its turn
-    (free for user/other-agent input), then resumed on the watcher's completion
-    notification. It confirmed by `exec_collect.py` evidence
+    `watch.sh <log_path> <pid_path>` as a background shell (`block_until_ms: 0`)
+    and ended its turn (free for user/other-agent input), then resumed on the
+    watcher's completion notification. It confirmed by `exec_collect.py` evidence
     (`verdict.json.green`: clean tree + HEAD advanced past the recorded baseline,
     AND the agent's loop_report met-criteria with tests passing) before
     dispatching the next — a commit alone was never enough, and it never read the
@@ -426,10 +439,13 @@ execution_loop_report:
 [ ] `.agents/skills/cli-escalation-notify/SKILL.md` fired on plan start, plan finish, and every
     problem.
 [ ] Directives were injected into the **same** agent via
-    `cursor-agent --resume <chat_id>` (never a fresh launch for steering);
-    mid-run injection was user-triggered and relayed only on the explicit marker
-    (`subagent:` / `agent:` / "tell the agent ..."); high-severity used
-    kill+relaunch (no mid-turn preemption exists), low-severity was held and
+    `cursor-agent --resume <chat_id>` (never a fresh launch for steering),
+    wrapped like a dispatch (stream appended to `pane.log`, `agent.pid`
+    rewritten, `__EXEC_DONE__` sentinel) with a **fresh** `watch.sh <log_path>
+    <pid_path>` started before the turn ended — never a side log the watcher
+    isn't reading; mid-run injection was user-triggered and relayed only on the
+    explicit marker (`subagent:` / `agent:` / "tell the agent ..."); high-severity
+    used kill+relaunch (no mid-turn preemption exists), low-severity was held and
     delivered after the turn; each injection fired
     `.agents/skills/cli-escalation-notify/SKILL.md`.
 [ ] Only environment issues were treated as blockers; everything else was
