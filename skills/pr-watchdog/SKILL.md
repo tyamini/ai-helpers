@@ -75,12 +75,15 @@ tokenless HTTP.
   in-turn `AwaitShell`-sleep poll loop.
 - `scripts/pr_watchdog.py resolve` — resolve a unique PR from the local branch.
 - `scripts/pr_watchdog.py trigger --pr N [--full] [--server SLUG]` — post the Jenkins rebuild
-  request. **For a fresh HEAD (a new commit, a base-merge, or a PR-prefix/title change) use
-  `--full`**: it posts the single global `pipeline please rebuild` comment — no host/server
-  slug, no `failed` qualifier — and **always posts** (a brand-new HEAD has no statuses to
-  discover, so it never bails with `no-ci-yet`). Without `--full` it rebuilds only the failed
-  servers (`pipeline please rebuild failed <slug>` per discovered server, or just `--server`
-  ones) — use that form only to retry a specific flaky/failed server.
+  request. **Anything the watchdog pushes — a fix commit OR a base-merge — is a fresh HEAD and
+  MUST be rebuilt with `--full`.** `--full` posts the single global `pipeline please rebuild`
+  comment — no host/server slug, no `failed` qualifier — and **always posts** (a brand-new HEAD
+  has no statuses to discover, so it never bails with `no-ci-yet`). Without `--full` it rebuilds
+  only the failed servers (`pipeline please rebuild failed <slug>` per discovered server, or just
+  `--server` ones) — use that form **only to retry a flaky/failed server on a HEAD that was
+  already built**. As a safety net the script itself auto-promotes a non-`--full` call to a clean
+  full rebuild whenever HEAD has no CI statuses of its own (i.e. a freshly pushed fix/merge that
+  was never built), so a caller that pushed and forgot `--full` still rebuilds clean.
 - `scripts/update_branch.sh --check|--apply <wt> <base> [--push] [--keep-conflict]` — detect /
   fix "branch behind base" **and surface base↔branch merge conflicts**. `--apply` merges
   `origin/<base>` (pushes on `--push`). A clean merge (`ACTION=merged`) is the one
@@ -121,6 +124,16 @@ tokenless HTTP.
   once at the end** and trigger a single rebuild. NEVER push a partial fix (e.g. the
   base-merge on its own) that would burn a rebuild before the failure is actually fixed, and
   would also push the last CI-bearing commit out of reach.
+- **Every push triggers a CLEAN FULL rebuild — no exceptions.** Whenever the watchdog pushes
+  anything (a base-merge, a pre-build/lint fix, or an approved code fix — i.e. any new HEAD),
+  it MUST trigger with `scripts/pr_watchdog.py trigger --pr <pr> --full` (the single global
+  `pipeline please rebuild`). NEVER post a per-server `pipeline please rebuild failed <slug>`
+  after a push: the new HEAD needs every pipeline rebuilt, and a per-server "failed" rerun only
+  re-runs the previously-failed stages, leaving other stages unvalidated against the new code
+  (risking a false green). The per-server "failed" form is reserved **exclusively** for
+  retrying a flaky/failed server on a HEAD that was already built and where **nothing was
+  pushed** (Stage 3a/3b flaky retries). The `trigger` script enforces this defensively by
+  auto-promoting any non-`--full` call to a full rebuild when HEAD has no CI of its own.
 - **Order within the batch depends on the failure type:**
   - **Build / pre-build failure (or reconcile-only):** base-merge **first** (resolving any
     conflict via Stage 3m), then the build fix — so the fix builds on the updated base
@@ -577,6 +590,7 @@ A markdown summary (Stage 5 shape) plus the `~/.pr-watchdog-runs/<run_id>/` tree
 - [ ] Pre-build failures were ALWAYS handed to the `systematic-debugging` subagent; the loop never attempted an inline pre-build/lint fix.
 - [ ] CI config / workflows / suite registry / test-stage selection were never edited to force green.
 - [ ] Deterministic flows ran via the scripts; pre-test failures went to a generic `systematic-debugging` subagent (local fix-until-pass) and test failures to `pr-failure-handler`.
+- [ ] Every push (base-merge, pre-build/lint fix, or approved code fix) was followed by a CLEAN FULL rebuild (`trigger --full` → global `pipeline please rebuild`); the per-server `rebuild failed <slug>` form was used only to retry a flaky/failed server on an already-built HEAD where nothing was pushed.
 - [ ] The RUNNING-wait used the backgrounded `pr_watchdog.py watch` process (not in-turn `AwaitShell` sleeps); the agent resumed on its completion notification. Every non-`WATCH_TRANSITION` watcher exit (max-runtime / fatal / vanished) produced a `watcher stopped` notification — silence was never treated as green.
 - [ ] In CLI context, a Slack event fired for each PR event and each analysis (state transitions/actions, not every identical poll), via `cli-escalation-notify`; status recorded in `meta.json`.
 - [ ] Commits used `git-conventions` (with `[AI generated]`); no `git add -A`; protected branches never pushed to directly.

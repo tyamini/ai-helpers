@@ -9,20 +9,24 @@ Keep every prompt tight: goal + only this task's Claude harness paths + the plan
 path. Fill the bracketed fields per task and **drop harness lines the task does
 not use**.
 
+Every task is created with `--auto-review-mode commit` — the deployed Kanban CLI
+has no `done` mode. Tasks that produce changes get committed and cherry-picked
+onto the work branch; a verification-only task that ends with zero working changes
+is auto-moved to Done by commit mode, which advances the chain.
+
 Rules that apply to all templates:
 - **Reference the harness by bare `label: path`.** Never transcribe its commands
   and never add a parenthetical describing what a doc contains.
 - **Do NOT tell any task to commit or push** (except `finalize`, which pushes and
-  opens the PR). Auto-review owns commits: `commit`-mode tasks are committed and
-  cherry-picked onto the work branch automatically; `done`-mode tasks make no git
-  changes.
+  opens the PR). Auto-review owns commits: commit-mode tasks are committed and
+  cherry-picked onto the work branch automatically.
 - **Do not restate the plan.** Point at it; the agent reads it.
 - **Only a real environment blocker** (infra prevents using tools, editing,
   compiling, or testing) stops a task early; it reports that verbatim.
 
 ---
 
-## phase-1-validate  (auto-review mode: `done`)
+## phase-1-validate  (auto-review mode: `commit`; ends with no changes -> auto-done)
 
 ```
 Read-only validation for a kanban-execution-loop pipeline. Do NOT edit, commit,
@@ -84,7 +88,7 @@ for a real environment blocker; report it verbatim.
 
 ---
 
-## finalize  (auto-review mode: `done`)
+## finalize  (auto-review mode: `commit`; pushes/opens PR itself, no changes -> auto-done)
 
 ```
 The plans for this pipeline have all been executed and validated on this work

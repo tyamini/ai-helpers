@@ -6,40 +6,49 @@ reference behind SKILL.md; read it once when the pipeline's behavior is unclear.
 
 ## The chain
 
-For N plans the skill builds a single linear chain of board cards:
+For N plans the skill builds a single linear chain of board cards. Every task
+uses `--auto-review-mode commit`:
 
 ```
-phase-1-validate           (done)
-      -> plan-01-exec      (commit)
-      -> plan-01-validate  (commit)
-      -> plan-02-exec      (commit)
-      -> plan-02-validate  (commit)
+phase-1-validate
+      -> plan-01-exec
+      -> plan-01-validate
+      -> plan-02-exec
+      -> plan-02-validate
       -> ...
-      -> plan-NN-exec      (commit)
-      -> plan-NN-validate  (commit)
-      -> finalize          (done)
+      -> plan-NN-exec
+      -> plan-NN-validate
+      -> finalize
 ```
 
 Each edge is a Kanban dependency where the **waiter waits on the prerequisite**:
 `kanban task link --task-id <waiter> --linked-task-id <prereq>`. When the
 prerequisite finishes review and moves to Done, the waiting backlog task
-auto-starts. The skill starts only `phase-1-validate`; everything after it starts
-itself as its predecessor completes.
+auto-starts. **The skill starts nothing** — every task is created into the
+backlog and left there; the user starts `phase-1-validate` to kick off the run,
+and everything after it starts itself as its predecessor completes.
 
 Slugs: `phase-1-validate`, `plan-NN-exec`, `plan-NN-validate` (NN = zero-padded
 plan index), `finalize`.
 
-## Auto-review modes and why
+## Auto-review mode and why
 
-Every task is created with `--auto-review-enabled true`. The mode differs by task
-type because the board's auto-review is what advances the chain:
+The deployed Kanban CLI only accepts auto-review modes `commit` and `pr` —
+**there is no `done` mode**. So every task is created with `--auto-review-enabled
+true --auto-review-mode commit`. The board's auto-review is what advances the
+chain, and commit mode covers both task shapes:
 
-| Task | Mode | Reason |
-|------|------|--------|
-| phase-1-validate | `done` | Read-only; makes no git changes. `done` moves it straight to Done, which auto-starts plan-01-exec. |
-| plan-NN-exec | `commit` | Produces code. `commit` commits the worktree changes and cherry-picks them onto the work branch, then (on the next clean review) moves to Done. |
-| plan-NN-validate | `commit` | May fix gaps (then commit+cherry-pick). If it changed nothing, `commit` mode still auto-moves a clean review to Done, so a pure PASS also advances. |
-| finalize | `done` | Its prompt pushes the branch and opens the PR itself; there is nothing for auto-review to commit. |
+| Task | What commit mode does |
+|------|-----------------------|
+| phase-1-validate | Read-only; ends with **zero working changes**, and commit mode auto-moves a clean review straight to Done (which auto-starts plan-01-exec). |
+| plan-NN-exec | Produces code. Commit mode commits the worktree changes and cherry-picks them onto the work branch, then (on the next clean review) moves to Done. |
+| plan-NN-validate | May fix gaps (then commit+cherry-pick). If it changed nothing, commit mode still auto-moves the clean review to Done, so a pure PASS also advances. |
+| finalize | Its prompt pushes the branch and opens the PR itself; it makes no working-tree changes, so commit mode auto-moves the clean review to Done. |
+
+The **zero-change auto-done** behavior is specific to commit mode (a clean review
+under commit mode is treated as "nothing to commit -> Done"); pr mode is
+intentionally excluded from it, which is why verification-only tasks use commit,
+not pr.
 
 Key consequence: **there is no pass/fail gate on the board.** Moving a card to
 Done always advances the chain. That is why validate tasks must independently
@@ -70,7 +79,7 @@ Putting those together, the design makes plans accumulate like this:
 
 1. **All tasks share ONE work branch as `--base-ref`.** The skill creates that
    branch in Stage 2.
-2. Each `commit`-mode task cherry-picks its commit onto the shared work branch.
+2. Each commit-mode task cherry-picks its commit onto the shared work branch.
 3. The next task's worktree is created only after its predecessor finished, so it
    is detached at the (now-advanced) work-branch tip and contains all prior work.
 4. `finalize` pushes that single accumulated branch and opens one PR.
@@ -79,8 +88,8 @@ Putting those together, the design makes plans accumulate like this:
 
 - **Plans + harness docs must be committed to the base branch** (or be absolute
   paths outside the repo). A fresh worktree only contains what is committed on the
-  branch — uncommitted working-tree plan files will be invisible to the tasks.
-  Stage 1 / phase-1-validate exists to catch this.
+  branch — uncommitted working-tree plan files will be invisible to the tasks. The
+  phase-1-validate task exists to catch this; the skill itself does not verify it.
 - **Leave the main repo checked out on the work branch.** `commit` mode looks for
   a worktree where `{{base_ref}}` is checked out to cherry-pick into; the main
   repo checkout is the natural target. If the work branch is checked out nowhere,

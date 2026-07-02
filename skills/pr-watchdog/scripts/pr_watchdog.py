@@ -18,10 +18,13 @@ Subcommands (JSON on stdout):
   watch    Block-poll a PR until CI transitions (PASSED/FAILED/behind) or max-runtime,
            then exit — so a backgrounded run's completion notification wakes the agent
            even after its turn has ended. Liveness is independent of any agent turn.
-  trigger  Post a Jenkins rebuild request PR comment (via gh). Default: rebuild the
-           failed servers ("pipeline please rebuild failed <slug>" per discovered server).
-           With --full: post the single global "pipeline please rebuild" (no slug, no
-           "failed") for a fresh HEAD (new commit, base-merge, PR-prefix change); always posts.
+  trigger  Post a Jenkins rebuild request PR comment (via gh). With --full: post the single
+           global "pipeline please rebuild" (no slug, no "failed") for a fresh HEAD (new
+           commit, base-merge, PR-prefix change); always posts. Without --full: rebuild the
+           failed servers ("pipeline please rebuild failed <slug>" per discovered server) —
+           but ONLY for a HEAD that was actually built. A HEAD with no CI statuses of its own
+           (a freshly pushed fix/merge) is auto-promoted to a clean full rebuild, so anything
+           pushed always rebuilds clean.
 
 Exit codes:
   0  success (JSON on stdout) — for `watch`, a WATCH_TRANSITION was reached
@@ -378,6 +381,21 @@ def cmd_jmc(args):
     return proc.returncode
 
 
+def _post_full_rebuild(pr, dry_run, reason, extra=None):
+    """Post the single global 'pipeline please rebuild' (clean full rebuild)."""
+    comment = "pipeline please rebuild"
+    payload = {"triggered": False, "full": True, "comment": comment, "reason": reason}
+    if extra:
+        payload.update(extra)
+    if dry_run:
+        print(json.dumps(payload))
+        return 0
+    _out, rc = _gh(["pr", "comment", str(pr), "-R", REPO, "--body", comment], parse=False, check=False)
+    payload["triggered"] = rc == 0
+    print(json.dumps(payload))
+    return 0
+
+
 def cmd_trigger(args):
     pr = args.pr
 
@@ -386,15 +404,7 @@ def cmd_trigger(args):
     # slug and no "failed" qualifier, and never bail out — a brand-new HEAD has no statuses
     # to discover, so this must always post (no host, no fail).
     if args.full:
-        comment = "pipeline please rebuild"
-        if args.dry_run:
-            print(json.dumps({"triggered": False, "full": True, "comment": comment}))
-            return 0
-        _out, rc = _gh(["pr", "comment", str(pr), "-R", REPO, "--body", comment], parse=False, check=False)
-        print(json.dumps({
-            "triggered": rc == 0, "full": True, "comment": comment, "reason": "full-rebuild-requested",
-        }))
-        return 0
+        return _post_full_rebuild(pr, args.dry_run, "full-rebuild-requested")
 
     view = _gh(["pr", "view", str(pr), "-R", REPO, "--json", "mergeStateStatus"])
     if view.get("mergeStateStatus") == "BEHIND":
@@ -408,6 +418,19 @@ def cmd_trigger(args):
     # discover the (stable) server contexts. The rebuild comment rebuilds current HEAD.
     sha = _pr_head_sha(pr)
     statuses, catalog_source = _statuses_with_fallback(pr, sha)
+
+    # SAFETY: any HEAD that has no CI statuses of its OWN is a freshly pushed commit — a fix
+    # commit or a base-merge — so `catalog_source` fell back to a historical commit. Such a
+    # HEAD MUST get a complete rebuild of every pipeline; a per-server "rebuild failed <slug>"
+    # would rerun only the previously-failed stages and can leave stages unvalidated against
+    # the new code (risking a false green). Auto-promote to a clean full rebuild so that a
+    # caller which pushed something but forgot --full still rebuilds clean. Per-server retries
+    # remain available only for a HEAD that was actually built (catalog_source == "head").
+    if catalog_source != "head":
+        return _post_full_rebuild(
+            pr, args.dry_run, "fresh-head-auto-full",
+            {"auto_promoted_full": True, "catalog_source": catalog_source, "head_sha": sha},
+        )
 
     # Optionally restrict to specific failed servers (by slug); default = all discovered.
     only = set(args.server or [])

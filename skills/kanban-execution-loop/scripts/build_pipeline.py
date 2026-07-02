@@ -20,12 +20,13 @@ stdin JSON:
     "model": null,                        # accepted for parity; unused by the CLI
     "tasks": [                            # required; in creation order
       {"slug": "phase-1-validate", "title": "...", "prompt": "...",
-       "auto_review_mode": "done"},
+       "auto_review_mode": "commit"},
       {"slug": "plan-01-exec", "title": "...", "prompt": "...",
        "auto_review_mode": "commit"}
     ],
     "links": [["plan-01-exec", "phase-1-validate"]],  # [waiter_slug, prereq_slug]
-    "start_slug": "phase-1-validate"      # optional; task to start after wiring
+    "start_slug": null                    # optional; omit/null to leave all tasks
+                                          # in backlog (the skill starts nothing)
   }
 
 stdout JSON:
@@ -48,7 +49,10 @@ import shutil
 import subprocess
 import sys
 
-VALID_MODES = {"commit", "pr", "done"}
+# The deployed Kanban CLI only accepts these auto-review modes (not "done").
+# A "commit"-mode task with zero working changes is auto-moved to Done anyway, so
+# verification-only tasks use "commit" too.
+VALID_MODES = {"commit", "pr"}
 
 
 def fail(error: str, **extra) -> "None":
