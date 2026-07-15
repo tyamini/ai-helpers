@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -66,7 +67,7 @@ def resolve_kanban_cli() -> list[str]:
     """Prefer the CLI Kanban injected for spawned tasks; else the global binary."""
     injected = os.environ.get("KANBAN_CLI", "").strip()
     if injected:
-        return [injected]
+        return shlex.split(injected)
     if shutil.which("kanban"):
         return ["kanban"]
     # Last resort: npx. Kept explicit so failures are legible.
