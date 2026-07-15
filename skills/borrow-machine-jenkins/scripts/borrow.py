@@ -355,7 +355,14 @@ def main() -> int:
                           help="Skip the BaseOS replacement stage (default: enabled).")
     p_borrow.add_argument("--no-skip-baseos", dest="skip_baseos", action="store_false",
                           help="Run the BaseOS replacement stage (slower; forces a clean OS).")
-    p_borrow.add_argument("--allow-multiple", action="store_true")
+    # Allow the same user to hold multiple setups at once. Enabled by default;
+    # pass --no-allow-multiple to restore Jenkins' stricter single-setup rule.
+    p_borrow.add_argument("--allow-multiple", dest="allow_multiple",
+                          action="store_true", default=True,
+                          help="Allow the same user to borrow multiple setups (default: enabled).")
+    p_borrow.add_argument("--no-allow-multiple", dest="allow_multiple",
+                          action="store_false",
+                          help="Disallow borrowing multiple setups at once.")
 
     p_return = sub.add_parser("return", help="Return a borrowed machine.")
     p_return.add_argument("--machine", required=True, help="Machine name to return.")
