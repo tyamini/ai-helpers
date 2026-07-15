@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Collect a per-plan agent result into a verdict.
 
-Combines the completion return code (from pane.log), the cursor-agent output
-(pane.log stream-json, for the chat id), and git evidence (HEAD advanced + clean tree)
-into a deterministic verdict. The git evidence is authoritative for "done" -
-never the agent's self-report.
+Combines the completion return code (from pane.log), the agent CLI output
+(pane.log stream-json, for the chat id — same shape for `cursor-agent` and
+`claude`), and git evidence (HEAD advanced + clean tree) into a deterministic
+verdict. The git evidence is authoritative for "done" - never the agent's
+self-report.
 
 Also pulls the per-plan agent's implementation-loop verdict (exit_reason,
 verification) from the terminal `result` event so the executor can refuse to
 advance on a "committed but red" plan. Git evidence still owns "committed";
 the agent self-report only gates `green`.
 
+Also aggregates the trustworthy counters (turns, output/cache tokens, API time,
+approximate cost) across the plan's `result` events into `metrics`, so the run
+summary can report them without the executor eyeballing the pane. The CLI's
+self-reported per-turn wall `duration_ms` is deliberately excluded — under the
+backgrounded `-p` invocation this skill uses it is unreliable.
+
 Reads JSON on stdin: {run_id, slug, baseline_sha, repo_root}
 Writes ~/.exec-runs/<run_id>/plans/<slug>/verdict.json and emits it on stdout:
   {status, rc, baseline_sha, head_sha, clean_tree, committed, exit_reason,
-   verification, loop_report_found, green, chat_id, collected_at}
+   verification, loop_report_found, green, chat_id, metrics, collected_at}
 
 Telemetry (deterministic, fail-open): after the verdict is written, invokes
 `run_ledger.py ingest-pane` to turn this plan's finished pane.log + verdict.json
@@ -68,12 +75,12 @@ def _ingest_pane(run_id: str, slug: str, repo: str) -> None:
 
 
 def _reap(plan_dir: str) -> None:
-    """Kill a lingering per-plan cursor-agent and close its pane. Fail-open.
+    """Kill a lingering per-plan agent process and close its pane. Fail-open.
 
-    A headless `cursor-agent -p` can finish its turn without the process exiting;
-    left alone it leaks for hours. Resuming a chat does not need the old process
-    alive (--resume rehydrates server-side state), so reaping after collect is
-    always safe.
+    A headless `cursor-agent -p` / `claude -p` can finish its turn without the
+    process exiting; left alone it leaks for hours. Resuming a chat does not need
+    the old process alive (--resume rehydrates conversation state), so reaping
+    after collect is always safe.
     """
     pid_path = os.path.join(plan_dir, "agent.pid")
     try:
@@ -175,6 +182,63 @@ def _extract_loop_report(path: str):
     }
 
 
+def _extract_metrics(path: str):
+    """Aggregate the reliable counters across the plan's `result` events.
+
+    Sums, over every terminal `result` event in pane.log (dispatch + each
+    resume, subagent finals included): `num_turns`; per-model output +
+    cache-read tokens and cost from `modelUsage` (falling back to top-level
+    `usage`/`total_cost_usd`); and `duration_api_ms`. `invocations` counts the
+    result events that did real work (num_turns > 0).
+
+    These come straight from the agent CLI and are trustworthy as cumulative
+    plan totals. Two things are intentionally NOT surfaced: the self-reported
+    per-turn wall `duration_ms` (unreliable under the backgrounded `-p`
+    invocation — observed identical to <1s across independent runs while API
+    time differed 2.4x; use the executor's own phase timestamps for wall clock),
+    and cost is `~approximate` (the CLI's `total_cost_usd` and `modelUsage`
+    cost can disagree for the same event). Fail-open: returns zeros on any error.
+    """
+    m = {"invocations": 0, "turns": 0, "output_tokens": 0,
+         "cache_read_tokens": 0, "api_minutes": 0.0, "cost_usd": 0.0}
+    if not os.path.exists(path):
+        return m
+    api_ms = 0
+    cost = 0.0
+    try:
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if '"type":"result"' not in line or not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(o, dict) or o.get("type") != "result":
+                continue
+            turns = o.get("num_turns") or 0
+            if turns:
+                m["invocations"] += 1
+            m["turns"] += turns
+            api_ms += o.get("duration_api_ms") or 0
+            mu = o.get("modelUsage") or {}
+            if mu:
+                for mv in mu.values():
+                    m["output_tokens"] += mv.get("outputTokens") or 0
+                    m["cache_read_tokens"] += mv.get("cacheReadInputTokens") or 0
+                    cost += mv.get("costUSD") or 0
+            else:
+                u = o.get("usage") or {}
+                m["output_tokens"] += u.get("output_tokens") or 0
+                m["cache_read_tokens"] += u.get("cache_read_input_tokens") or 0
+                cost += o.get("total_cost_usd") or 0
+    except OSError:
+        return m
+    m["api_minutes"] = round(api_ms / 60000.0, 1)
+    m["cost_usd"] = round(cost, 2)
+    return m
+
+
 def main() -> int:
     d = json.load(sys.stdin)
     run_id = d["run_id"]
@@ -196,6 +260,11 @@ def main() -> int:
 
     chat_id = _extract_chat_id(pane_log)
     lr = _extract_loop_report(pane_log)
+    metrics = _extract_metrics(pane_log)
+    try:
+        agent = open(os.path.join(plan_dir, "agent"), encoding="utf-8").read().strip()
+    except OSError:
+        agent = None
 
     head = _git(repo, "rev-parse", "HEAD")
     clean = _git(repo, "status", "--porcelain") == ""
@@ -226,6 +295,8 @@ def main() -> int:
         "loop_report_found": lr["found"],
         "green": green,
         "chat_id": chat_id,
+        "agent": agent,
+        "metrics": metrics,
         "collected_at": _now(),
     }
     with open(os.path.join(plan_dir, "verdict.json"), "w", encoding="utf-8") as f:

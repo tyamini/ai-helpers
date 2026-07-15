@@ -7,17 +7,24 @@ description: Execute one or more already-written plans end-to-end by dispatching
 
 ## Goal
 Carry a set of approved plans to completion: validate they are executable
-up front, then dispatch one **top-level `cursor-agent` process per plan**
+up front, then dispatch one **top-level agent-CLI process per plan**
 (strictly sequential) that drives its entire plan until every pass criterion is
 met and commits the result. The executor itself orchestrates, notifies, helps
 agents past genuine blockers, and pushes the branch at the end. It does **not**
 write plan code itself — the per-plan agents do.
 
+The per-plan **agent CLI is selectable**: `cursor` (`cursor-agent`) or `claude`
+(Claude Code, `claude`). One agent is chosen per run (Stage 2) and used for every
+plan; the scripts, watcher, and collector are agent-agnostic because both CLIs
+emit the same stream-json shape (one JSON object per line, each carrying
+`session_id`, ending in a `type:"result"` event). `cursor-agent` appears below as
+the illustrative CLI, but everything applies equally to `claude`.
+
 Each per-plan agent is launched via deterministic scripts (JSON in/out) into a
-tmux pane running `cursor-agent`. Launching it as a **top-level** process —
+tmux pane running the chosen agent CLI. Launching it as a **top-level** process —
 rather than a Task subagent — is deliberate: a Task subagent cannot spawn its
 own subagents, so a per-plan Task subagent is forced to implement+review inline.
-A top-level `cursor-agent` is free to dispatch implementation-loop's own
+A top-level agent CLI is free to dispatch implementation-loop's own
 implementer/reviewer subagents, giving a real depth-3 tree
 (executor → per-plan agent → implementer/reviewer) that the run-ledger captures.
 
@@ -27,14 +34,21 @@ free for user (or other-agent) input. It is re-woken by the watcher's background
 completion notification the moment the agent finishes (not after any timeout) —
 it does **not** read the agent's output/transcript while it runs (that would
 burn its context for no benefit). At any time the executor (being free) can act
-on user input: relay an explicitly-marked directive into the agent's chat via
-`cursor-agent --resume <chat_id>`, or interrupt the run outright
+on user input: relay an explicitly-marked directive into the agent's chat
+(`scripts/exec_resume.py`, which resumes the chat for either CLI), or interrupt
+the run outright
 (see [Directive injection](#directive-injection)). Run state lives in
 `~/.exec-runs/<run_id>/`, so the loop resumes cleanly across turn boundaries.
 
 ## Inputs
 - **Plans** — one or more plan files . At least one is required. Order matters: later plans
   may depend on earlier ones.
+- **Agent** (optional) — which per-plan agent CLI to launch: `cursor`
+  (`cursor-agent`) or `claude` (Claude Code). Defaults to the **same agent as the
+  main agent** running this skill (auto-detected from the process tree), so the
+  per-plan agents match the CLI you invoked the loop from. One agent is used for
+  the whole run. May be overridden via the `EXEC_LOOP_AGENT` env var or an
+  explicit request; only ask if detection fails and it is ambiguous.
 - **Parent branch** (optional) — the branch the work sits on top of. Defaults
   to the current branch; confirm with the user during validation.
 - **Parallelism** — sequential by default. Run plans in parallel **only**
@@ -52,30 +66,33 @@ on user input: relay an explicitly-marked directive into the agent's chat via
 
 ## Companion scripts and references (in this skill dir)
 - `scripts/exec_session.py` — resolve/create the run's tmux session (JSON out).
-- `scripts/exec_dispatch.py` — launch ONE per-plan `cursor-agent` in a tmux window (JSON in/out). Run, do not read.
-- `scripts/watch.sh` — completion watcher, run as a **background** shell (`block_until_ms: 0`); its completion notification re-wakes the executor. Wakes on the FIRST of: the anchored sentinel, a terminal `"type":"result"` event, the agent PID dying, or the log going idle — so a hung-but-idle `cursor-agent` can't strand the executor. Pass it `log_path` and the dispatch `pid_path`. Run, do not read.
+- `scripts/exec_dispatch.py` — launch ONE per-plan agent CLI (`cursor`/`claude`, selected by the `agent` field) in a tmux pane (JSON in/out). Run, do not read.
+- `scripts/exec_resume.py` — inject a directive by resuming a plan's chat with the same agent CLI, wrapped exactly like a dispatch (JSON in/out). Run, do not read.
+- `scripts/watch.sh` — completion watcher, run as a **background** shell (`block_until_ms: 0`); its completion notification re-wakes the executor. Wakes on the FIRST of: the anchored sentinel, a terminal `"type":"result"` event, the agent PID dying, or the log going idle — so a hung-but-idle agent can't strand the executor. Pass it `log_path` and the dispatch `pid_path`. Run, do not read.
 - `scripts/exec_collect.py` — git evidence + the agent's loop_report verdict (`exit_reason`/`verification`, from the terminal `result` event) into `verdict.json` (JSON in/out). Emits `green` = committed AND met-criteria AND tests pass.
 - `references/run-state.md` — the `~/.exec-runs/<run_id>/` tree and every script's JSON contract.
 - `references/dispatch-prompt.md` — the per-plan agent prompt.
-- The `cursor-agent` CLI must be on `PATH`, and `CURSOR_API_KEY` (or a logged-in session) available to launched processes.
+- The selected agent's CLI must be on `PATH` with usable auth for launched processes: `cursor-agent` needs `CURSOR_API_KEY` (or a logged-in session); `claude` needs a logged-in session (or `ANTHROPIC_API_KEY`). `exec_dispatch.py` fails with `agent-not-available` if the chosen CLI is missing.
 
 ## Hard invariants
 - **No plan authoring here.** The executor orchestrates and pushes. All
   implementation, compiling, and testing happen inside the per-plan agents.
 - **Deterministic scripts own all mechanical actions.** tmux session
-  resolution, agent launch, completion watching, and result collection happen in
-  the `scripts/` above with JSON in/out. The executor invokes them and consumes
-  their JSON — it never hand-rolls tmux/`cursor-agent` commands inline and never
-  eyeballs pane contents for control flow.
+  resolution, agent launch, directive injection, completion watching, and result
+  collection happen in the `scripts/` above with JSON in/out. The executor
+  invokes them and consumes their JSON — it never hand-rolls tmux or agent-CLI
+  commands inline and never eyeballs pane contents for control flow. The
+  agent-CLI specifics (cursor vs claude flags, `--resume`) live entirely in the
+  scripts.
 - **Validation is delegated and read-only.** Stage 1 runs in a single `explore`
   Task subagent that reads the plans and probes the filesystem and returns a
   compact report; the main loop never reads plans or checks files itself — it
   works from the report alone. (Stage 1 is the one place a Task subagent is still
-  used; everything else is `cursor-agent` processes.)
-- **One top-level `cursor-agent` per plan; one plan at a time.** Each per-plan
+  used; everything else is agent-CLI processes.)
+- **One top-level agent CLI per plan; one plan at a time.** Each per-plan
   agent runs the `.ai/skills/common/implementation-loop/SKILL.md` skill and is
-  launched via `scripts/exec_dispatch.py` (a top-level `cursor-agent -p` process
-  in its own tmux pane), **not** the Task tool — that is what lets it dispatch
+  launched via `scripts/exec_dispatch.py` (a top-level `cursor-agent -p` /
+  `claude -p` process in its own tmux pane), **not** the Task tool — that is what lets it dispatch
   its own implementer/reviewer subagents. Capture the returned `pane`. The
   executor then starts the background completion watcher and **ends its turn** —
   it does **not** block (no `AwaitShell` wait) and does not read the agent's
@@ -161,10 +178,17 @@ dependency notes.
    decide. In CLI context, first
    dispatch `.agents/skills/cli-escalation-notify/SKILL.md` (`title: execution-loop — clarification needed`)
    as a heads-up; the local question remains the answer channel.
-2. **Work branch.** Confirm the parent branch with the user (default: current),
+2. **Choose the agent.** By default use the **same agent CLI as the main agent**
+   running this skill — `exec_dispatch.py` auto-detects it from the process tree
+   (a `claude`/`cursor-agent` ancestor). Only override when the user explicitly
+   asks for a different CLI or `EXEC_LOOP_AGENT` is set; ask only if detection
+   fails and it is ambiguous. Verify the chosen CLI is on `PATH`
+   (`exec_dispatch.py` also enforces this and returns `agent-not-available` if
+   missing). This one agent is used for every plan in the run.
+3. **Work branch.** Confirm the parent branch with the user (default: current),
    then create the run's work branch per `.ai/skills/common/git-conventions/SKILL.md`. Verify the
    workspace is clean (`git status --porcelain`); if dirty, stop and ask.
-3. **Register the run (telemetry).** Generate a run id
+4. **Register the run (telemetry).** Generate a run id
    (`run_id="$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"`). Let
    `L=~/.drivenets/cheetah/AI/v2/private/tools/run-ledger/client/run_ledger.py`.
    Emit run-start (fire-and-forget, non-fatal — swallow errors):
@@ -179,18 +203,18 @@ dependency notes.
    `exec_collect.py` parses each finished agent's `pane.log` into its node
    (keyed by the agent's `session_id`, parented to `run_id`). There is **no**
    live registry, `init`/`resolve`, or `active.json`.
-4. **Resolve the tmux session.** Run `scripts/exec_session.py --run-id "$run_id"`.
+5. **Resolve the tmux session.** Run `scripts/exec_session.py --run-id "$run_id"`.
    It reuses the current session when inside tmux (`$TMUX` set), else creates a
    dedicated `exec-loop-<run_id>` session, and records the name. Keep the
    returned `{session, origin}`. If it returns an `error`, halt and surface it.
    Write `meta.json` (`references/run-state.md`) with the run_id, branch, parent,
-   repo_root, session, origin, model, and context.
+   repo_root, session, origin, agent, model, and context.
 
 **Gate:** No open questions; the work branch is checked out on the confirmed
 parent, the tree is clean, the run-start record was emitted, and the tmux
 session is resolved with `meta.json` written.
 
-### Stage 3: Execute — one cursor-agent per plan
+### Stage 3: Execute — one agent CLI per plan
 For each plan in order (sequential unless the user opted into parallel). `slug`
 is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
 
@@ -204,10 +228,11 @@ is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
    (goal + only the harness paths this plan needs + related-plan status) and save
    it to `~/.exec-runs/<run_id>/plans/<slug>/prompt.txt`. The prompt carries no
    telemetry step — the agent's node is parsed from its `pane.log` at collect time.
-4. **Dispatch one top-level `cursor-agent`.** Pipe JSON to
+4. **Dispatch one top-level agent CLI.** Pipe JSON to
    `scripts/exec_dispatch.py`: `{run_id, slug, plan_path, branch, repo_root,
-   model, prompt_path}`. It splits a tmux pane and launches `cursor-agent`.
-   Keep the returned `{pane, log_path, pid_path}`. Do **not** use the Task tool here.
+   agent, model, prompt_path}`. It splits a tmux pane and launches the chosen
+   CLI (`cursor-agent` or `claude`).
+   Keep the returned `{pane, log_path, pid_path, agent}`. Do **not** use the Task tool here.
 5. **Start the completion watcher in the background, then free the turn.** Run
    `scripts/watch.sh <log_path> <pid_path>` via the Shell tool with
    `block_until_ms: 0` (background — capture its shell id) so it does **not**
@@ -231,7 +256,7 @@ is `<NNN>-<sanitized-plan-name>` (NNN = zero-padded plan index).
    `exit_reason: met-criteria` with `verification: pass`. A commit alone is not
    enough: a committed-but-not-green plan (tests failed/not-run/blocked, or no
    parseable report) is a **reported problem** → [Blocker policy](#blocker-policy);
-   resume the same agent via `cursor-agent --resume <chat_id>` to finish the
+   resume the same agent via `scripts/exec_resume.py` to finish the
    real work — never advance on the commit alone. Once `green`, dispatch
    `.agents/skills/cli-escalation-notify/SKILL.md`
    (`title: execution-loop — finished plan <name>`).
@@ -302,36 +327,38 @@ tight (goal + only this plan's harness paths + related-plan status). Do not
 duplicate it here.
 
 ## Directive injection
-While a per-plan agent runs, the executor can steer it by resuming its chat via
-`cursor-agent --resume <chat_id> -p "<directive>"` — the same conversation with
-its context preserved, **never a fresh launch** for steering. The `chat_id` is
-the cursor-agent `session_id`, available from `verdict.json` after the agent
-finishes (and, mid-run, from `pane.log` — the stream-json `system/init` line emits it first).
+While a per-plan agent runs, the executor can steer it by resuming its chat with
+`scripts/exec_resume.py` (JSON in: `{run_id, slug, directive}`) — the same
+conversation with its context preserved, **never a fresh launch** for steering.
+The script owns the agent-CLI `--resume` specifics for both `cursor` and
+`claude` (reading the plan's recorded agent and `chat_id`, its `session_id`,
+available from `verdict.json` after the agent finishes and, mid-run, from
+`pane.log` — the stream-json `system/init` line emits it first).
 
 **Every resume must be watchable exactly like a dispatch, or the loop can
-stall.** When you resume, wrap it the same way `exec_dispatch.py` does — append
-its stream to the plan's **`pane.log`** (not a side log), background the
-`cursor-agent` and rewrite `agent.pid` with its PID, and emit the trailing
-`__EXEC_DONE__ rc=$?` sentinel — then start a **fresh** `scripts/watch.sh
-<log_path> <pid_path>` background shell before ending the turn. A resume that
-writes to a separate log the watcher isn't reading, or that has no
-result-event / PID / idle signal, is how a finished-but-hung `cursor-agent`
+stall** — which is why `exec_resume.py` wraps it the same way `exec_dispatch.py`
+does: it appends the stream to the plan's **`pane.log`** (not a side log),
+backgrounds the agent CLI and rewrites `agent.pid` with its PID, and emits the
+trailing `__EXEC_DONE__ rc=$?` sentinel. After calling it, start a **fresh**
+`scripts/watch.sh <log_path> <pid_path>` background shell before ending the
+turn. A resume that writes to a separate log the watcher isn't reading, or that
+has no result-event / PID / idle signal, is how a finished-but-hung agent
 stranded the executor with no running agent. Collect still reads `pane.log`
 only, so keeping the resume stream there is also what lets it see the real
 loop_report.
 
 - **Behavior change vs Task subagents — no mid-run preemption.** A headless
-  `cursor-agent -p` runs its turn to completion; you cannot interrupt it mid-turn
-  the way Task `resume --interrupt` did. So:
+  `cursor-agent -p` / `claude -p` runs its turn to completion; you cannot
+  interrupt it mid-turn the way Task `resume --interrupt` did. So:
   - **High severity** (wrong direction / must stop now / would waste significant
     work): kill the run — `tmux send-keys -t <pane> C-c` then, if needed, kill
     the pane/process — and relaunch the plan via `scripts/exec_dispatch.py` with
     a corrected prompt (fresh baseline). This is the only way to stop wasted work
     immediately.
   - **Low severity** (optional hint/extra context): **hold** it and deliver it
-    after the agent finishes its turn via `cursor-agent --resume <chat_id> -p
-    "<directive>"`. If the plan already committed (evidence gate passed) before
-    you deliver it, the hint is moot — drop it.
+    after the agent finishes its turn via `scripts/exec_resume.py`. If the plan
+    already committed (evidence gate passed) before you deliver it, the hint is
+    moot — drop it.
 - **Trigger (user only, during the run):** the executor's turn has **ended**
   while the agent runs (it is free), so it does not watch the agent. Mid-run
   injection happens when the **user** (or another agent) sends a message to the
@@ -355,12 +382,12 @@ committed with `verification` failed/not-run/blocked, or no parseable
 loop_report), the executor decides:
 - **Not an environment issue** (failing logic, flaky test, unclear step,
   forgot to commit, tests not run): normal work. Help the agent — clarify, point at the right
-  harness/doc, or resume it via `cursor-agent --resume <chat_id> -p "<directive>"`
+  harness/doc, or resume it via `scripts/exec_resume.py`
   (kill+relaunch only for high-severity course corrections, per
   [Directive injection](#directive-injection)) — and let it keep going until the
   pass criteria are met and it has committed. This is not a blocker.
 - **Real environment issue** the agent and the executor cannot fix (tools
-  unavailable, cannot compile, cannot test, infra down, `cursor-agent` cannot
+  unavailable, cannot compile, cannot test, infra down, the agent CLI cannot
   launch/auth): dispatch `.agents/skills/cli-escalation-notify/SKILL.md`
   (`title: execution-loop — blocked: <reason>`), then **pause the loop and ask
   the user**. Do not skip the plan or fabricate success.
@@ -371,12 +398,16 @@ Stop and surface to the user (with a CLI notify) when:
 - A referenced file is unreachable, a required harness is absent, or a
   companion skill cannot be resolved to a readable `SKILL.md` (Stage 1).
 - The workspace is dirty and the user has not chosen how to proceed.
-- The tmux session cannot be resolved, or `cursor-agent` cannot launch/auth
-  (`scripts/exec_session.py` / `scripts/exec_dispatch.py` returns an `error`).
+- The tmux session cannot be resolved, or the chosen agent CLI cannot
+  launch/auth or is missing (`scripts/exec_session.py` / `scripts/exec_dispatch.py`
+  returns an `error`, e.g. `agent-not-available`).
 - A real environment blocker hits a per-plan agent and cannot be fixed.
 
 ## Output format
-End the run with a concise report:
+End the run with a concise report. Include a per-plan **counts** table and a
+**timeline** table (render both as compact markdown tables). Report only
+trustworthy numbers, sourced as noted; do **not** invent per-turn wall times or
+present a cost as exact.
 
 ```yaml
 execution_loop_report:
@@ -384,18 +415,42 @@ execution_loop_report:
   branch: <work-branch>
   parent: <parent-branch>
   tmux_session: <session> (<created|reused>)
+  agent: cursor|claude
   parallel: false|true
   plans:
     - plan: <path>
       pass_criteria: met|blocked
       commit: <sha-or-none>
-      chat_id: <cursor-agent session_id>
+      chat_id: <agent CLI session_id>
       notes: <1-line>
   push: pushed|skipped
   blockers:
     - plan: <path>
       reason: <env blocker, if any>
 ```
+
+**Counts (per plan)** — straight from `verdict.json.metrics` (the collector's
+aggregate of the agent CLI's own `result` events; cumulative across dispatch +
+every resume):
+
+| plan | invocations | turns | output tokens | cache-read tokens | api min | cost (~) |
+|------|-------------|-------|---------------|-------------------|---------|----------|
+
+Cost is approximate — the agent CLI's own cost fields can disagree for the same
+event. Do **not** add a per-turn wall-duration column: the CLI's `duration_ms`
+is unreliable under the backgrounded `-p` invocation (observed identical across
+independent runs while API time differed), so it is intentionally not collected.
+
+**Timeline (wall clock)** — from the executor's **own** recorded phase
+timestamps (the `started_at` each `exec_dispatch.py`/`exec_resume.py` returned,
+and each `exec_collect.py` `collected_at`), never from `duration_ms`:
+
+| phase | span (start–end) | elapsed |
+|-------|------------------|---------|
+
+Cover setup, each plan's dispatch run and any resume run(s), and finalize; end
+with a total-wall row. A resume shows as its own phase, so a plan that needed a
+Blocker-policy resume is visible as two runs.
 
 ## Quality bar (self-check)
 [ ] Stage 1 ran in one read-only `explore` validation subagent that read every
@@ -411,11 +466,14 @@ execution_loop_report:
 [ ] A single work branch was created per `.ai/skills/common/git-conventions/SKILL.md` on the confirmed
     parent; the tree was clean before starting.
 [ ] All mechanical actions went through the deterministic `scripts/` with JSON
-    in/out (session resolve, dispatch, watch, collect); no inline tmux /
-    `cursor-agent` commands and no eyeballing pane contents for control flow.
+    in/out (session resolve, dispatch, resume, watch, collect); no inline tmux or
+    agent-CLI commands and no eyeballing pane contents for control flow.
 [ ] The tmux session was reused (inside tmux) or created (`exec-loop-<run_id>`)
     via `scripts/exec_session.py`, and `meta.json` was written.
-[ ] Exactly one top-level `cursor-agent` was launched per plan via
+[ ] A single agent CLI (`cursor` or `claude`) was chosen for the run (Stage 2)
+    and its binary confirmed on `PATH`; it was passed as `agent` to every
+    dispatch/resume.
+[ ] Exactly one top-level agent CLI was launched per plan via
     `scripts/exec_dispatch.py` (NOT the Task tool), each running the
     `.ai/skills/common/implementation-loop/SKILL.md` skill, with `pane`/`chat_id`
     captured, strictly sequential (parallel only on explicit user opt-in).
@@ -439,10 +497,10 @@ execution_loop_report:
 [ ] `.agents/skills/cli-escalation-notify/SKILL.md` fired on plan start, plan finish, and every
     problem.
 [ ] Directives were injected into the **same** agent via
-    `cursor-agent --resume <chat_id>` (never a fresh launch for steering),
-    wrapped like a dispatch (stream appended to `pane.log`, `agent.pid`
-    rewritten, `__EXEC_DONE__` sentinel) with a **fresh** `watch.sh <log_path>
-    <pid_path>` started before the turn ended — never a side log the watcher
+    `scripts/exec_resume.py` (never a fresh launch for steering), which wraps the
+    resume like a dispatch (stream appended to `pane.log`, `agent.pid`
+    rewritten, `__EXEC_DONE__` sentinel); a **fresh** `watch.sh <log_path>
+    <pid_path>` was started before the turn ended — never a side log the watcher
     isn't reading; mid-run injection was user-triggered and relayed only on the
     explicit marker (`subagent:` / `agent:` / "tell the agent ..."); high-severity
     used kill+relaunch (no mid-turn preemption exists), low-severity was held and
@@ -454,3 +512,7 @@ execution_loop_report:
     no fabricated success.
 [ ] The executor pushed the branch once at the end; no protected branch was
     pushed; no PR opened unless the user asked.
+[ ] The run report included the per-plan counts table (from
+    `verdict.json.metrics`) and the wall-clock timeline table (from the
+    executor's own recorded phase timestamps, one row per dispatch/resume run);
+    no per-turn `duration_ms` was reported and cost was marked approximate.

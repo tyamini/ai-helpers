@@ -19,7 +19,14 @@ always-loaded prompt.
         evidence.json
         progress.md        # systematic-debugging subagent phase checklist (pre-test)
         repro-<n>.log      # systematic-debugging subagent local build/lint runs (pre-test)
-      suggested-fix.md     # non-trivial test fix only (pr-failure-handler)
+      predict/             # only when Stage 2p ran (Feature 2 — pre-terminal coverage prediction)
+        predict.json       # verbatim `predict_tests.py` output (per-item will-run/wont-run/cant-tell)
+        summary.md         # subagent write-up (only when result == some-wont-run)
+        suggested-fix.md   # subagent's concrete fix for the wont-run items (pr-prefix / marker / registration)
+      tests-ran/           # only when Stage 2t ran (Feature 2 — post-CI coverage verify)
+        summary.md
+        evidence.json      # {added, ran, not_run:[{id,cause,suggested_fix}], inconclusive}
+      suggested-fix.md     # non-trivial test fix (pr-failure-handler) OR a Stage 2t coverage fix
       patch.diff           # applied fix diff (lint/validate/prebuild/code), when present
 ```
 
@@ -49,6 +56,10 @@ Written at Stage 1; updated at every push / escalation / event.
     {"cycle": 3, "kinds": ["branch-update", "prebuild"], "sha": "<sha>", "files": ["..."]}
   ],
   "known_server_slugs": ["israel1", "israel3", "aws5", "aws6", "aws7", "aws8"],
+  "last_review": {"sha": "<SHA review was last requested for>", "posted": ["codex", "copilot"], "already": [], "skipped": "merge-commit | null"},
+  "last_prediction": {"sha": "<HEAD Stage 2p predicted>", "result": "all-will-run | some-wont-run | cant-tell-only", "wont_run": ["<file::test>"]},
+  "accepted_not_run": ["<file::test the user accepted as an intentional build-only run at Stage 2p>"],
+  "last_tests_ran": {"sha": "<terminal-CI HEAD verified>", "result": "all-ran | some-not-run | inconclusive", "not_run": ["<file::test>"], "overall": "PASSED | FAILED"},
   "last_trigger": {"sha": "<HEAD sha a rebuild was requested for>", "at": "<ISO-8601>"},
   "watcher": {"pid": 12345, "started_at": "<ISO-8601>", "interval": 600, "max_runtime": 86400, "last_exit": "transition | maxruntime | fatal | null"},
   "last_escalation_notify": "sent | skipped | send-failed | null"
@@ -61,8 +72,9 @@ turn ends and wakes the agent via the harness background-completion notification
 distinguishes a clean `WATCH_TRANSITION` (`transition`) from the cases that MUST notify
 `watcher stopped` (`maxruntime`, `fatal`, or the job vanishing → recorded by the agent).
 
-`is_cli_context == true` iff `$CURSOR_AGENT` is set AND `$CURSOR_LAYOUT` is unset
-(matches `cli-escalation-notify`). Do NOT also gate on `$VSCODE_AGENT_FOLDER`.
+`is_cli_context` mirrors the headless-CLI-vs-IDE decision **owned by `cli-escalation-notify`**
+(true in a headless CLI such as Claude Code or cursor-agent; false in an IDE agent panel). The
+watchdog records the value that skill would use rather than re-implementing the detection.
 
 `worktree_mode` is `worktree` by default (an isolated worktree checked out on the PR branch).
 On a `worktree-conflict` (PR branch already checked out in the main repo) the user may opt
@@ -102,9 +114,15 @@ Verbatim stdout of `scripts/pr_watchdog.py status --pr <pr>`:
 
 Base reconciliation: `behind` and a conflicted PR are **distinct** signals. GitHub reports a
 conflicted PR as `merge_state_status == DIRTY` (`mergeable_state: dirty`), **not** `behind`.
-The watchdog treats `needs-base-reconcile = behind == true OR merge_state_status == DIRTY`;
-both route to Stage 3 (base-merge, then Stage 3m conflict resolution if the merge conflicts),
-including a green-but-dirty PR.
+The watchdog treats `needs-base-reconcile = behind == true OR merge_state_status == DIRTY`, but
+this is **not** an action trigger on its own: a branch merely `behind` while a build is RUNNING
+is benign and is left alone (never interrupt an in-progress build to chase a moving base). The
+reconcile only rides along when the loop is already headed to a push/trigger — a
+**PASSED-but-un-mergeable** PR, a `FAILED` remediation, or a `NO_CI`/idle trigger (CI must not
+start on a behind/dirty HEAD). The one early exception is `conflict-early`: a `DIRTY` conflict
+caught while the build has only just begun (nothing PASSED yet) is worth resolving + restarting
+immediately, since a conflicted PR can't merge even if it goes green. All of these go to Stage 3
+(base-merge, then Stage 3m conflict resolution if the merge conflicts).
 
 ## `action.json` — what the watchdog did this cycle
 
@@ -112,8 +130,8 @@ including a green-but-dirty PR.
 {
   "cycle": 3,
   "situation": "failed",
-  "decision": "wait | trigger | update-branch | resolve-conflict | prebuild-fix | investigate | escalate | done",
-  "fix_kind": "branch-update | merge-conflict | prebuild | code-fix | null",
+  "decision": "wait | trigger | update-branch | resolve-conflict | prebuild-fix | investigate | request-review | predict-coverage | verify-tests-ran | escalate | done",
+  "fix_kind": "branch-update | merge-conflict | prebuild | code-fix | coverage-fix | null",
   "prebuild_result": "fixed-locally | needs-escalation | null",
   "cycles_used": 0,
   "auto_pushed": false,

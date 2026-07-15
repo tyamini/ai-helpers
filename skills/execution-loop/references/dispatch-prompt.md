@@ -1,12 +1,12 @@
 # Per-plan agent prompt
 
 This is the prompt the executor writes to `<plan_dir>/prompt.txt` and passes to
-the per-plan `cursor-agent` (Stage 3). It is the cursor-agent equivalent of the
-old Task "Subagent prompt". Keep it tight: goal + harness referenced by file
-path + related-plan status. Do not restate plan contents. Fill the bracketed
-fields; drop harness lines the plan does not use.
+the per-plan agent CLI — `cursor-agent` or `claude` (Stage 3). It is the
+agent-CLI equivalent of the old Task "Subagent prompt". Keep it tight: goal +
+harness referenced by file path + related-plan status. Do not restate plan
+contents. Fill the bracketed fields; drop harness lines the plan does not use.
 
-Because this agent runs as a **top-level `cursor-agent` process** (not a Task
+Because this agent runs as a **top-level agent-CLI process** (not a Task
 subagent), it may dispatch its own subagents if its skill does.
 
 Telemetry needs nothing from this prompt: the agent's run-ledger node is parsed
